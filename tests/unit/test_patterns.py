@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from hermes_semantic_diff_weaver.ast_diff import StructuralDelta
-from hermes_semantic_diff_weaver.models import BehaviorCategory, LineRange
+from hermes_semantic_diff_weaver.models import BehaviorCategory, LineRange, WeaverConfig
 from hermes_semantic_diff_weaver.semantic_candidates import build_candidates
 
 
@@ -30,3 +30,22 @@ def test_material_unknown_stays_explicit() -> None:
     result = candidate("unknown_structure", "old bytecode factory", "new bytecode factory")
     assert result.category is BehaviorCategory.UNKNOWN
     assert "review" in result.observable_impact
+
+
+def test_refactor_materiality_threshold_is_enforced() -> None:
+    change = candidate("structural_refactor", "old_name", "new_name")
+    assert change.category is BehaviorCategory.REFACTOR
+    delta = StructuralDelta(
+        path="src/change.py",
+        symbol="change",
+        kind="structural_refactor",
+        old="old_name",
+        new="new_name",
+        old_lines=LineRange(start=1, end=1),
+        new_lines=LineRange(start=1, end=1),
+        hunk_id="src/change.py#hunk-001",
+        metadata={"materiality": 0.5},
+    )
+    config = WeaverConfig()
+    config.rules.refactor_materiality_threshold = 0.25
+    assert build_candidates([delta], config)[0].category is BehaviorCategory.UNKNOWN

@@ -24,6 +24,11 @@ CACHE_PARTS = {
 SECRET_NAMES = {
     ".env",
     ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "accesstokens.json",
+    "application_default_credentials.json",
+    "azureprofile.json",
     "credentials",
     "credentials.json",
     "git-credentials",
@@ -50,6 +55,8 @@ REDACTIONS = (
         r"(?i)\b(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*['\"]?[^\s'\"]{8,}"
     ),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\b(?:xox[baprs]-[A-Za-z0-9-]{20,}|AIza[0-9A-Za-z_-]{30,})\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
 )
 
 
@@ -63,7 +70,7 @@ def path_error(message: str) -> WeaverError:
 
 def normalize_repo_path(value: str) -> str:
     """Validate an untrusted repository-relative path and normalize it to POSIX form."""
-    if not value or "\x00" in value or "\r" in value or "\n" in value:
+    if not value or "\x00" in value:
         raise path_error("Git returned an empty or invalid repository path.")
     normalized = value.replace("\\", "/")
     posix = PurePosixPath(normalized)
@@ -107,7 +114,14 @@ def exclusion_reason(path: str) -> str | None:
         return "secret_filename"
     if any(token in name for token in ("credential", "password", "private_key")):
         return "secret_filename"
-    if "secret" in name and suffix in {".json", ".toml", ".yaml", ".yml", ".ini", ".cfg"}:
+    if any(token in name for token in ("secret", "token")) and suffix in {
+        ".cfg",
+        ".ini",
+        ".json",
+        ".toml",
+        ".yaml",
+        ".yml",
+    }:
         return "secret_filename"
     return None
 

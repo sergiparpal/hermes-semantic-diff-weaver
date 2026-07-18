@@ -17,6 +17,8 @@ import.
   `--no-ext-diff`, and `--no-textconv` where relevant.
 - Every Git/config path is normalized and checked; VCS metadata, traversal, absolute/drive/UNC paths,
   reserved device names, and mandatory secret classes are rejected or excluded.
+- Repository-local config symlinks must resolve inside the repository, and both sides of a rename are
+  checked so renaming a secret-looking path cannot expose its old committed content.
 - Binary, oversized, non-UTF-8, credential-named, cache, environment, and control files are omitted
   visibly.
 - Obvious inline token/private-key forms are redacted before evidence, model input, output, or errors.
@@ -24,6 +26,8 @@ import.
   only deterministic evidence IDs and cannot trigger reads, tools, subprocesses, network access, or
   configuration changes.
 - The plugin makes no direct network request and emits no plugin telemetry.
+- Resource prioritization is deterministic and applies only to explicitly configured critical paths;
+  it never expands the configured file, line, symbol, evidence, or model-input ceilings.
 
 Expected errors expose safe normalized counts or paths only. Raw source, prompts, provider responses,
 environment values, credentials, and absolute repository paths are not returned.

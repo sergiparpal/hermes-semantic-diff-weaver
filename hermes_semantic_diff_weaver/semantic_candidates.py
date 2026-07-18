@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .ast_diff import StructuralDelta
-from .models import BehaviorCategory, Evidence, Origin
+from .models import BehaviorCategory, Evidence, Origin, WeaverConfig
 
 AUTH_TERMS = ("auth", "permission", "permit", "role", "owner", "identity", "principal")
 VALIDATION_TERMS = ("valid", "validate", "validator", "allowed", "reject", "accept")
@@ -52,9 +52,18 @@ def _contains(text: str, terms: tuple[str, ...]) -> bool:
 
 
 def _classification(
-    delta: StructuralDelta,
+    delta: StructuralDelta, config: WeaverConfig
 ) -> tuple[BehaviorCategory, str, str, float, list[str], str]:
     combined = " ".join(filter(None, (delta.old, delta.new, delta.symbol)))
+    if delta.kind == "parse_incomplete":
+        return (
+            BehaviorCategory.UNKNOWN,
+            "Changed Python syntax could not be parsed completely.",
+            "The affected committed hunk may change observable behavior and requires review.",
+            0.68,
+            ["Only bounded Git hunk metadata is available because static parsing failed."],
+            "SDW-RULE-PARSE-INCOMPLETE",
+        )
     if delta.kind == "comparison_change":
         if _contains(combined, RETRY_TERMS):
             return (
@@ -232,6 +241,18 @@ def _classification(
             "SDW-RULE-ORDERING",
         )
     if delta.kind == "structural_refactor":
+        materiality = float(delta.metadata.get("materiality", 0.0))
+        if materiality > config.rules.refactor_materiality_threshold:
+            return (
+                BehaviorCategory.UNKNOWN,
+                "A refactor-like change exceeds the configured materiality threshold.",
+                "Observable behavior may have changed even though the symbol appears refactored.",
+                0.58,
+                [
+                    "Normalized structural similarity was insufficient for a no-behavior-change claim."
+                ],
+                "SDW-RULE-REFACTOR-MATERIAL",
+            )
         return (
             BehaviorCategory.REFACTOR,
             "The changed symbol retains the same normalized behavior-bearing structure.",
@@ -259,11 +280,16 @@ def _classification(
     )
 
 
-def build_candidates(deltas: list[StructuralDelta]) -> list[SemanticCandidate]:
+def build_candidates(
+    deltas: list[StructuralDelta], config: WeaverConfig | None = None
+) -> list[SemanticCandidate]:
     """Apply stable rules, create evidence IDs, and merge same-symbol categories."""
+    effective_config = config or WeaverConfig()
     grouped: dict[tuple[str, str, BehaviorCategory], SemanticCandidate] = {}
     for index, delta in enumerate(deltas, start=1):
-        category, summary, impact, baseline, assumptions, rule_id = _classification(delta)
+        category, summary, impact, baseline, assumptions, rule_id = _classification(
+            delta, effective_config
+        )
         evidence = Evidence(
             id=f"ev-{index:03d}",
             path=delta.path,

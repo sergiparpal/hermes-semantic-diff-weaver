@@ -9,6 +9,8 @@ description = "Read-only semantic Git diff analysis and risk-ranked test obligat
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Hermes Semantic Diff Weaver contributors" }]
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
   "pydantic>=2.10,<3",
   "PyYAML>=6.0.2,<7",
@@ -43,6 +45,7 @@ branch = true
 source = ["hermes_semantic_diff_weaver"]
 
 [tool.coverage.report]
+fail_under = 85
 show_missing = true
 skip_covered = true
 

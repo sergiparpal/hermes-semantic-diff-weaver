@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .errors import ErrorCode, WeaverError
 from .models import WeaverConfig
-from .path_policy import exclusion_reason, is_included, normalize_repo_path
+from .path_policy import exclusion_reason, glob_matches, is_included, normalize_repo_path
 
 GIT_TIMEOUT_SECONDS = 15
 MAX_GIT_OUTPUT_BYTES = 16 * 1024 * 1024
@@ -54,6 +54,8 @@ class DiffCollection:
     changed_lines: int
     excluded_counts: dict[str, int]
     warnings: list[str]
+    omitted_counts: dict[str, int] = field(default_factory=dict)
+    truncated: bool = False
 
 
 def _git_error(code: ErrorCode, message: str, remediation: str) -> WeaverError:
@@ -114,13 +116,16 @@ class GitRepository:
         env = os.environ.copy()
         env.update(
             {
+                "GIT_ATTR_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
                 "GIT_TERMINAL_PROMPT": "0",
                 "GIT_OPTIONAL_LOCKS": "0",
                 "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_PAGER": "cat",
                 "LC_ALL": "C.UTF-8",
             }
         )
-        command = [self.git, "-c", "core.quotepath=false", *arguments]
+        command = [self.git, "--no-pager", "-c", "core.quotepath=false", *arguments]
         try:
             completed = subprocess.run(
                 command,
@@ -212,6 +217,30 @@ class GitRepository:
             return None
         try:
             return raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return None
+
+    def entry_mode(self, commit: str, path: str) -> str | None:
+        """Return the committed Git mode without following symlinks or Git links."""
+        if not COMMIT_RE.fullmatch(commit):
+            raise _git_error(ErrorCode.INVALID_REF, "An unresolved commit was rejected.", "Retry.")
+        normalized = normalize_repo_path(path)
+        try:
+            raw = self.run(
+                ["ls-tree", "-z", commit, "--", normalized],
+                max_bytes=64 * 1024,
+                binary=True,
+            )
+        except WeaverError:
+            return None
+        if not raw:
+            return None
+        header = raw.split(b"\t", 1)[0]
+        parts = header.split(b" ", 2)
+        if len(parts) != 3:
+            return None
+        try:
+            return parts[0].decode("ascii", errors="strict")
         except UnicodeDecodeError:
             return None
 
@@ -312,6 +341,91 @@ def _hunks(repo: GitRepository, base: str, head: str, path: str) -> list[Hunk]:
     return result
 
 
+def _critical_weight(path: str, config: WeaverConfig) -> int:
+    return max(
+        (item.weight for item in config.critical_paths if glob_matches(path, item.pattern)),
+        default=0,
+    )
+
+
+def _resource_selection(
+    files: list[ChangedFile],
+    stats: dict[str, tuple[int, int, bool]],
+    changed_lines: int,
+    config: WeaverConfig,
+) -> tuple[set[str] | None, dict[str, int], list[str]]:
+    """Prioritize bounded critical-path scope when global metadata exceeds defaults."""
+    files_exceeded = len(files) > config.rules.max_changed_files
+    lines_exceeded = changed_lines > config.rules.max_diff_lines
+    if not files_exceeded and not lines_exceeded:
+        return None, {}, []
+    if not config.critical_paths:
+        if files_exceeded:
+            raise _git_error(
+                ErrorCode.DIFF_TOO_LARGE,
+                f"The diff contains {len(files)} changed files; the configured limit is "
+                f"{config.rules.max_changed_files}.",
+                "Narrow the include patterns, split the change, or increase "
+                "rules.max_changed_files.",
+            )
+        raise _git_error(
+            ErrorCode.DIFF_TOO_LARGE,
+            f"The diff contains {changed_lines} changed lines; the configured limit is "
+            f"{config.rules.max_diff_lines}.",
+            "Narrow the include patterns, split the change, or increase rules.max_diff_lines.",
+        )
+    eligible = [
+        item
+        for item in files
+        if item.path.endswith(".py")
+        and not any(exclusion_reason(path) for path in (item.old_path, item.new_path) if path)
+        and is_included(item.path, config.paths.include, config.paths.exclude)
+    ]
+    ranked = sorted(
+        eligible,
+        key=lambda item: (
+            -_critical_weight(item.path, config),
+            -sum(stats.get(item.path, (0, 0, False))[:2]),
+            item.path,
+        ),
+    )
+    if not ranked or _critical_weight(ranked[0].path, config) == 0:
+        raise _git_error(
+            ErrorCode.DIFF_TOO_LARGE,
+            "The diff exceeds configured limits and no bounded critical-path scope can be selected.",
+            "Narrow the include patterns, split the change, or configure a matching critical path.",
+        )
+    selected: set[str] = set()
+    selected_lines = 0
+    for changed in ranked:
+        if len(selected) >= config.rules.max_changed_files:
+            break
+        additions, deletions, _ = stats.get(changed.path, (0, 0, False))
+        file_lines = additions + deletions
+        if file_lines > config.rules.max_diff_lines and _critical_weight(changed.path, config):
+            raise _git_error(
+                ErrorCode.DIFF_TOO_LARGE,
+                "A prioritized critical-path file exceeds the configured changed-line limit.",
+                "Split the critical-path change or increase rules.max_diff_lines.",
+            )
+        if selected_lines + file_lines > config.rules.max_diff_lines:
+            continue
+        selected.add(changed.path)
+        selected_lines += file_lines
+    if not selected:
+        raise _git_error(
+            ErrorCode.DIFF_TOO_LARGE,
+            "The diff exceeds configured limits and no file fits the bounded analysis scope.",
+            "Narrow the include patterns or split the change.",
+        )
+    omitted = max(0, len(eligible) - len(selected))
+    omitted_counts = {"resource_prioritization": omitted} if omitted else {}
+    warnings = [
+        "The diff exceeded global resource limits; analyzed prioritized critical-path scope only."
+    ]
+    return selected, omitted_counts, warnings
+
+
 def collect_diff(
     repo: GitRepository,
     base_commit: str,
@@ -335,13 +449,6 @@ def collect_diff(
         binary=True,
     )
     files = _parse_name_status(name_raw)
-    if len(files) > config.rules.max_changed_files:
-        raise _git_error(
-            ErrorCode.DIFF_TOO_LARGE,
-            f"The diff contains {len(files)} changed files; the configured limit is "
-            f"{config.rules.max_changed_files}.",
-            "Narrow the include patterns, split the change, or increase rules.max_changed_files.",
-        )
     numstat_raw = repo.run(
         [
             "diff",
@@ -356,19 +463,23 @@ def collect_diff(
         binary=True,
     )
     stats, changed_lines = _parse_numstat(numstat_raw)
-    if changed_lines > config.rules.max_diff_lines:
-        raise _git_error(
-            ErrorCode.DIFF_TOO_LARGE,
-            f"The diff contains {changed_lines} changed lines; the configured limit is "
-            f"{config.rules.max_diff_lines}.",
-            "Narrow the include patterns, split the change, or increase rules.max_diff_lines.",
-        )
+    selected_scope, omitted_counts, resource_warnings = _resource_selection(
+        files, stats, changed_lines, config
+    )
     excluded: Counter[str] = Counter()
     selected: list[ChangedFile] = []
-    warnings: list[str] = []
+    warnings: list[str] = list(resource_warnings)
     for changed in files:
         path = changed.path
-        reason = exclusion_reason(path)
+        reason = next(
+            (
+                current
+                for candidate_path in (changed.old_path, changed.new_path)
+                if candidate_path
+                if (current := exclusion_reason(candidate_path))
+            ),
+            None,
+        )
         if reason:
             excluded[reason] += 1
             continue
@@ -378,12 +489,26 @@ def collect_diff(
         if not path.endswith(".py"):
             excluded["unsupported_extension"] += 1
             continue
+        if selected_scope is not None and path not in selected_scope:
+            excluded["resource_prioritization"] += 1
+            continue
         additions, deletions, binary = stats.get(path, (0, 0, False))
         changed.additions = additions
         changed.deletions = deletions
         changed.binary = binary
         if binary:
             excluded["binary"] += 1
+            continue
+        modes = {
+            repo.entry_mode(commit, candidate_path)
+            for commit, candidate_path in (
+                (base_commit, changed.old_path),
+                (head_commit, changed.new_path),
+            )
+            if candidate_path
+        }
+        if modes & {"120000", "160000"}:
+            excluded["symlink_or_gitlink"] += 1
             continue
         changed.hunks = _hunks(repo, base_commit, head_commit, path)
         if changed.old_path:
@@ -407,4 +532,6 @@ def collect_diff(
         changed_lines=changed_lines,
         excluded_counts=dict(sorted(excluded.items())),
         warnings=warnings,
+        omitted_counts=omitted_counts,
+        truncated=selected_scope is not None,
     )

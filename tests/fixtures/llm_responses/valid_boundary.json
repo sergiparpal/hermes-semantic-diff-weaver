@@ -1,0 +1,13 @@
+{
+  "behaviors": [
+    {
+      "category": "boundary_change",
+      "summary": "The exact limit is now accepted.",
+      "observable_impact": "A value at the limit may now be accepted.",
+      "evidence_ids": ["ev-001"],
+      "assumptions": [],
+      "confidence": 0.9
+    }
+  ],
+  "obligations": []
+}

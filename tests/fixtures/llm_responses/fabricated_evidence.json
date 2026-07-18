@@ -1,0 +1,13 @@
+{
+  "behaviors": [
+    {
+      "category": "boundary_change",
+      "summary": "Unsupported finding.",
+      "observable_impact": "This must be discarded.",
+      "evidence_ids": ["ev-999"],
+      "assumptions": [],
+      "confidence": 0.9
+    }
+  ],
+  "obligations": []
+}

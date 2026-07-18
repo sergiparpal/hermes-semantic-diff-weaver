@@ -3,15 +3,31 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .errors import ErrorCode
 
 SCHEMA_VERSION = "1.0"
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+
+def _repository_relative_posix_path(value: str) -> str:
+    """Validate paths embedded in public output without importing path-policy logic."""
+    if not value or "\x00" in value or "\\" in value:
+        raise ValueError("path must be a non-empty repository-relative POSIX path")
+    posix = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    if posix.is_absolute() or windows.is_absolute() or windows.drive:
+        raise ValueError("path must be repository-relative")
+    if any(part in {"", ".", ".."} for part in posix.parts):
+        raise ValueError("path contains traversal or an empty component")
+    return posix.as_posix()
 
 
 class OutputFormat(StrEnum):
@@ -123,7 +139,7 @@ class RulesConfig(StrictModel):
 
 
 class PrivacyConfig(StrictModel):
-    redact_patterns: bool = True
+    redact_patterns: Literal[True] = True
     allow_network: Literal[False] = False
 
 
@@ -167,6 +183,11 @@ class Evidence(StrictModel):
     kind: str = Field(min_length=1)
     parser_complete: bool = True
 
+    @field_validator("path")
+    @classmethod
+    def relative_path(cls, value: str) -> str:
+        return _repository_relative_posix_path(value)
+
 
 class ScoreExplanation(StrictModel):
     behavioral_impact: float = Field(ge=0, le=100)
@@ -196,6 +217,11 @@ class CandidateTest(StrictModel):
     match_score: float = Field(ge=0, le=1)
     match_reasons: list[str] = Field(min_length=1)
     verified: Literal[False] = False
+
+    @field_validator("path")
+    @classmethod
+    def relative_path(cls, value: str) -> str:
+        return _repository_relative_posix_path(value)
 
 
 class TestObligation(StrictModel):
@@ -234,6 +260,11 @@ class ScopeMetadata(StrictModel):
     changed_lines: int = Field(ge=0)
     changed_symbols: int = Field(ge=0)
     truncated: bool = False
+
+    @field_validator("analyzed_files")
+    @classmethod
+    def relative_paths(cls, values: list[str]) -> list[str]:
+        return [_repository_relative_posix_path(value) for value in values]
 
 
 class Summary(StrictModel):
@@ -278,19 +309,39 @@ class AnalysisResult(StrictModel):
     @model_validator(mode="after")
     def references_resolve(self) -> AnalysisResult:
         behavior_ids = {item.id for item in self.behavior_changes}
+        if len(behavior_ids) != len(self.behavior_changes):
+            raise ValueError("behavior change IDs must be unique")
+        obligation_ids = {item.id for item in self.test_obligations}
+        if len(obligation_ids) != len(self.test_obligations):
+            raise ValueError("test obligation IDs must be unique")
+        evidence_registry: dict[str, Evidence] = {}
+        linked_behavior_ids: set[str] = set()
         for obligation in self.test_obligations:
             if not set(obligation.behavior_change_ids) <= behavior_ids:
                 raise ValueError("obligation references unknown behavior change")
-            for candidate in obligation.candidate_existing_tests:
-                if candidate.path.startswith(("/", "\\")) or ".." in candidate.path.split("/"):
-                    raise ValueError("candidate test path is outside repository")
+            if len(set(obligation.behavior_change_ids)) != len(obligation.behavior_change_ids):
+                raise ValueError("obligation repeats a behavior change reference")
+            linked_behavior_ids.update(obligation.behavior_change_ids)
+        for behavior in self.behavior_changes:
+            for evidence in behavior.evidence:
+                previous = evidence_registry.get(evidence.id)
+                if previous is not None and previous != evidence:
+                    raise ValueError("an evidence ID resolves to conflicting records")
+                evidence_registry[evidence.id] = evidence
+        required = {
+            item.id
+            for item in self.behavior_changes
+            if item.risk in {RiskLabel.HIGH, RiskLabel.CRITICAL}
+        }
+        if not required <= linked_behavior_ids:
+            raise ValueError("every high or critical behavior must have a linked obligation")
         return self
 
 
 class MarkdownEnvelope(StrictModel):
     success: Literal[True] = True
     schema_version: Literal["1.0"] = SCHEMA_VERSION
-    analysis_id: str
+    analysis_id: str = Field(pattern=r"^sdw_[A-Za-z0-9_-]+$")
     markdown: str
 
 
@@ -303,7 +354,7 @@ class BothEnvelope(StrictModel):
 
 class ErrorResponse(StrictModel):
     success: Literal[False] = False
-    error: str
+    error: ErrorCode
     message: str
     remediation: str
 

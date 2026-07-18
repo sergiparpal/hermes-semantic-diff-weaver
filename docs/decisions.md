@@ -15,13 +15,18 @@
 - The user's active Hermes provider/model/profile is used without routing overrides.
 - The plugin registers one standalone tool and no hooks, commands, skills, or overrides.
 
-## Compatibility snapshot (2026-07-17)
+## Compatibility snapshot (2026-07-18)
 
-- Local bundled test runtime: CPython 3.12.13 on Windows.
-- Local Git: 2.54.0.windows.1.
-- Hermes Agent was not installed in the local runtime, so no local runtime version or signature was
-  claimed.
-- Current official Hermes sources reported Hermes Agent 0.14.0 with Python `>=3.11`.
+- Local test runtime: CPython 3.12.3 on Linux.
+- Local Git: 2.43.0.
+- Hermes Agent 0.14.0 was installed in an isolated environment and passed pip-entry-point and
+  temporary-home directory discovery, registration, and exact-tool smoke tests.
+- Hermes Agent 0.13.0 was tested as the only earlier published release and failed the required
+  contract because `PluginContext.register_tool` lacks the `override` parameter. PyPI's release index
+  begins at 0.13.0, so 0.14.0 is the lowest verified compatible release.
+- The current Hermes Agent 0.18.2 release was also installed and passed the same discovery and
+  registration checks. It requires Python `>=3.11,<3.14`; this project remains Python `>=3.11` and
+  does not force-install or pin the host runtime.
 - `PluginContext.register_tool` accepts `name`, `toolset`, `schema`, `handler`, optional checks/env,
   async/description/emoji fields, and `override=False`.
 - `PluginLlm.complete_structured` accepts `instructions`, typed `input`, `json_schema`, `schema_name`,
@@ -30,14 +35,13 @@
 - Directory and pip entry-point discovery remain opt-in; project plugins require
   `HERMES_ENABLE_PROJECT_PLUGINS`.
 
-The lowest compatible Hermes release is intentionally not guessed. A fake-context contract suite and
-wheel entry-point smoke test are release gates; real Hermes discovery runs when a compatible runtime
-is present.
+The CI compatibility job installs Hermes 0.14.0 and the built plugin wheel, then repeats both real
+discovery paths. The regular fake-context suite continues to validate registration without requiring
+Hermes or a live model.
 
 ## Release note
 
-No license has been invented. Publication remains blocked on an explicit licensing decision, while
-local builds and tests are unaffected.
+The repository is licensed under MIT. Publishing or pushing remains a separately authorized action.
 
 ## Evaluation label review (2026-07-17)
 

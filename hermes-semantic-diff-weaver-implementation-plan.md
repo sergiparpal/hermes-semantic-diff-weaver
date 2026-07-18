@@ -1469,28 +1469,28 @@ Completion evidence:
 
 The MVP is complete only when all items below are true:
 
-- [ ] A caller can analyze a local Python Git repository with `repo_path` and `base_ref`; `head_ref` defaults to `HEAD`.
-- [ ] The Hermes plugin loads from a valid `plugin.yaml` and `__init__.py` and registers exactly `analyze_semantic_diff`.
-- [ ] The handler accepts `(args, **kwargs)` and always returns a valid JSON string.
-- [ ] The plugin returns schema-versioned canonical JSON.
-- [ ] JSON, Markdown, and both modes work.
-- [ ] Boundary, default argument, exception path, retry/loop limit, and function signature changes are detected deterministically.
-- [ ] All material behaviors include deterministic evidence and confidence.
-- [ ] Every high/critical behavior has at least one linked obligation.
-- [ ] Candidate tests are static, scored, explained, capped, and always labeled unverified.
-- [ ] Risk and confidence are independently calculated and presented.
-- [ ] High-risk, low-confidence items are review questions.
-- [ ] The plugin does not modify, import, execute, build, install, or test analyzed repository code.
-- [ ] Repository boundary, secret exclusion, prompt-injection, subprocess, and resource-limit tests pass.
-- [ ] The plugin makes at most eight bounded structured LLM calls and uses no model/provider/profile/agent override.
-- [ ] LLM unavailability returns a useful deterministic report when configured.
-- [ ] Omitted or truncated scope is explicit.
-- [ ] The evaluation corpus reaches at least 80% material precision and 70% supported-pattern recall.
-- [ ] Fabricated evidence count is zero.
-- [ ] Deterministic preprocessing meets the performance target on the reference fixture.
-- [ ] The entire automated suite, lint, formatting, package build, isolated install, and discovery smoke tests pass.
-- [ ] The Markdown brief requires no manual reformatting for a pull-request comment.
-- [ ] README and security/architecture/configuration/evaluation documentation match actual behavior.
+- [x] A caller can analyze a local Python Git repository with `repo_path` and `base_ref`; `head_ref` defaults to `HEAD`.
+- [x] The Hermes plugin loads from a valid `plugin.yaml` and `__init__.py` and registers exactly `analyze_semantic_diff`.
+- [x] The handler accepts `(args, **kwargs)` and always returns a valid JSON string.
+- [x] The plugin returns schema-versioned canonical JSON.
+- [x] JSON, Markdown, and both modes work.
+- [x] Boundary, default argument, exception path, retry/loop limit, and function signature changes are detected deterministically.
+- [x] All material behaviors include deterministic evidence and confidence.
+- [x] Every high/critical behavior has at least one linked obligation.
+- [x] Candidate tests are static, scored, explained, capped, and always labeled unverified.
+- [x] Risk and confidence are independently calculated and presented.
+- [x] High-risk, low-confidence items are review questions.
+- [x] The plugin does not modify, import, execute, build, install, or test analyzed repository code.
+- [x] Repository boundary, secret exclusion, prompt-injection, subprocess, and resource-limit tests pass.
+- [x] The plugin makes at most eight bounded structured LLM calls and uses no model/provider/profile/agent override.
+- [x] LLM unavailability returns a useful deterministic report when configured.
+- [x] Omitted or truncated scope is explicit.
+- [x] The evaluation corpus reaches at least 80% material precision and 70% supported-pattern recall.
+- [x] Fabricated evidence count is zero.
+- [x] Deterministic preprocessing meets the performance target on the reference fixture.
+- [x] The entire automated suite, lint, formatting, package build, isolated install, and discovery smoke tests pass.
+- [x] The Markdown brief requires no manual reformatting for a pull-request comment.
+- [x] README and security/architecture/configuration/evaluation documentation match actual behavior.
 
 ## 18. Final Codex Handoff Report
 

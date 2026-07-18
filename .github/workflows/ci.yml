@@ -12,8 +12,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python: ["3.11", "3.13"]
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: ubuntu-latest
+            python: "3.14"
+          - os: windows-latest
+            python: "3.11"
+          - os: windows-latest
+            python: "3.14"
+          - os: macos-latest
+            python: "3.14"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -21,8 +30,32 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-      - run: python -m pip install . pytest pytest-cov pytest-timeout ruff build
-      - run: python -m pytest --cov=hermes_semantic_diff_weaver --cov-branch
+          cache-dependency-path: requirements-dev.lock
+      - run: python -m pip install -r requirements-dev.lock
+      - run: python -m pip install . --no-deps
+      - run: >-
+          python -m pytest
+          --cov=hermes_semantic_diff_weaver
+          --cov-branch
+          --cov-report=json:coverage.json
+          --cov-report=term-missing
+      - run: python scripts/check_coverage.py coverage.json
       - run: python -m ruff check .
       - run: python -m ruff format --check .
       - run: python -m build
+      - run: python scripts/verify_wheel.py dist
+
+  hermes-compatibility:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.lock
+      - run: python -m pip install -r requirements-dev.lock
+      - run: python -m pip install "hermes-agent==0.14.0"
+      - run: python -m build
+      - run: python -m pip install dist/hermes_semantic_diff_weaver-*.whl
+      - run: python scripts/verify_hermes.py

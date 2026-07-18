@@ -45,4 +45,12 @@ privacy:
 Critical paths use `{pattern, weight}` entries. Mapping entries use `{source, tests}` and influence
 only static candidate ranking. YAML is size-bounded and loaded with `safe_load`. Unknown sections,
 custom tags, unsupported versions/languages, invalid ranges, duplicate mapping sources, absolute
-patterns, drive paths, NULs, and parent traversal are rejected.
+patterns, drive paths, NULs, and parent traversal are rejected. Repository-local configuration and
+every file it resolves through must remain inside the repository after symlink resolution; an
+explicitly named external `risk_profile` is the only exception.
+
+`privacy.redact_patterns` must remain `true` and `privacy.allow_network` must remain `false`.
+Configured excludes are additive with mandatory control, credential, key, token, cache, environment,
+and cloud-configuration exclusions. If a file/line budget is exceeded, configured critical paths are
+prioritized only when this can be done within the same hard bounds; all remaining scope is reported as
+omitted.

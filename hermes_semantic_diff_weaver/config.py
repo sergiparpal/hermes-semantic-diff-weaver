@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from .errors import ErrorCode, WeaverError
 from .models import AnalyzeRequest, WeaverConfig
+from .path_policy import ensure_contained
 
 MAX_CONFIG_BYTES = 256 * 1024
 
@@ -41,27 +42,33 @@ def _validate_config_paths(data: dict[str, Any]) -> None:
     paths = data.get("paths", {})
     if isinstance(paths, dict):
         for field in ("include", "exclude", "test_roots"):
-            for value in paths.get(field, []) or []:
-                _validate_relative_pattern(value, f"paths.{field}")
+            values = paths.get(field, []) or []
+            if isinstance(values, list):
+                paths[field] = [
+                    _validate_relative_pattern(value, f"paths.{field}") for value in values
+                ]
     for item in data.get("critical_paths", []) or []:
         if isinstance(item, dict) and "pattern" in item:
-            _validate_relative_pattern(item["pattern"], "critical_paths.pattern")
+            item["pattern"] = _validate_relative_pattern(item["pattern"], "critical_paths.pattern")
     for item in data.get("mapping", []) or []:
         if not isinstance(item, dict):
             continue
         if "source" in item:
-            _validate_relative_pattern(item["source"], "mapping.source")
-        for value in item.get("tests", []) or []:
-            _validate_relative_pattern(value, "mapping.tests")
+            item["source"] = _validate_relative_pattern(item["source"], "mapping.source")
+        tests = item.get("tests", []) or []
+        if isinstance(tests, list):
+            item["tests"] = [_validate_relative_pattern(value, "mapping.tests") for value in tests]
 
 
-def _read_yaml(path: Path) -> dict[str, Any]:
+def _read_yaml(path: Path, *, containment_root: Path | None = None) -> dict[str, Any]:
     try:
         resolved = path.resolve(strict=True)
     except OSError as exc:
         raise _configuration_error(
             "The configuration file does not exist or is inaccessible."
         ) from exc
+    if containment_root is not None:
+        resolved = ensure_contained(containment_root, resolved)
     if resolved.suffix.lower() not in {".yaml", ".yml"} or not resolved.is_file():
         raise _configuration_error("Configuration must be a regular .yaml or .yml file.")
     if resolved.stat().st_size > MAX_CONFIG_BYTES:
@@ -95,13 +102,13 @@ def load_config(repo_root: Path, request: AnalyzeRequest) -> tuple[WeaverConfig,
     hermes_path = repo_root / ".hermes" / "semantic-diff-weaver.yaml"
     local_path = repo_root / ".semantic-diff-weaver.yaml"
     if hermes_path.is_file():
-        data = _merge(data, _read_yaml(hermes_path))
+        data = _merge(data, _read_yaml(hermes_path, containment_root=repo_root))
         if local_path.is_file():
             warnings.append(
                 "Ignored .semantic-diff-weaver.yaml because the .hermes configuration has precedence."
             )
     elif local_path.is_file():
-        data = _merge(data, _read_yaml(local_path))
+        data = _merge(data, _read_yaml(local_path, containment_root=repo_root))
     if request.risk_profile:
         data = _merge(data, _read_yaml(Path(request.risk_profile)))
     request_override: dict[str, Any] = {"paths": {}}

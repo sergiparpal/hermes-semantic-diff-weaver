@@ -20,13 +20,20 @@ fabricated evidence references, an obligation for every high/critical behavior, 
 described as verified coverage. The corpus is intentionally small and synthetic; it does not validate
 dynamic behavior or external business contracts.
 
-## Local MVP result (2026-07-17)
+## Local MVP result (2026-07-18)
 
-On CPython 3.12.13 / Windows, the ten specification-derived material cases produced 100% material
-precision, 100% supported-pattern recall, and zero fabricated evidence references. All emitted
-findings carried deterministic evidence. The 100-symbol reference preprocessing fixture completed in
-approximately 0.01 seconds in the pytest timing run, below the five-second target. No live LLM call or
-credential was used.
+On CPython 3.12.3 / Linux with Git 2.43.0, the 16-case corpus (ten material taxonomy patterns plus
+refactor, ambiguity, rename/move, no-Python, mixed-parse, and critical-prioritization cases) produced
+100% material precision, 100% supported-pattern recall, 100% evidence-anchor correctness, 100%
+required obligation-concept match, and zero fabricated evidence references. Every high/critical
+finding had a linked obligation, and every candidate test remained explicitly unverified.
+
+The deterministic performance suite covers both a 100-symbol AST fixture with a five-second ceiling
+and a warmed full-service fixture with 40 files, 3,000 changed lines, and 100 symbols with a ten-second
+ceiling. They completed in approximately 0.02 seconds and 0.95 seconds respectively in the final
+local timing run. The complete automated suite reports 92.98% overall branch-aware coverage, with at
+least 90% branch coverage in each critical boundary/transport module. No live LLM call or credential
+was used.
 
 The fixture-label review removed a state-transition expectation from the retry-predicate case because
 the assignment itself was unchanged; retaining it would have rewarded a false positive. These numbers

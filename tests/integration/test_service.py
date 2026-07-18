@@ -5,7 +5,6 @@ from typing import Any
 
 import pytest
 
-from hermes_semantic_diff_weaver.errors import ErrorCode, WeaverError
 from hermes_semantic_diff_weaver.plugin import handle_analyze_semantic_diff
 from hermes_semantic_diff_weaver.service import analyze
 
@@ -45,7 +44,7 @@ def test_no_python_change_is_successful_empty_analysis(repo_factory) -> None:
     assert any("no included changed Python" in item for item in result["limitations"])
 
 
-def test_partial_parse_continues_and_total_parse_failure_is_safe(repo_factory) -> None:
+def test_parse_failures_retain_bounded_evidence_and_continue(repo_factory) -> None:
     repo, base, head = repo_factory(
         {"good.py": "def f(x):\n    return x < 2\n", "bad.py": "def broken(:\n"},
         {"good.py": "def f(x):\n    return x <= 2\n", "bad.py": "def broken_again(:\n"},
@@ -59,16 +58,18 @@ def test_partial_parse_continues_and_total_parse_failure_is_safe(repo_factory) -
     only_bad, bad_base, bad_head = repo_factory(
         {"bad.py": "def broken(:\n"}, {"bad.py": "def broken_again(:\n"}
     )
-    with pytest.raises(WeaverError) as caught:
-        analyze(
-            {
-                "repo_path": str(only_bad),
-                "base_ref": bad_base,
-                "head_ref": bad_head,
-                "output_format": "json",
-            }
-        )
-    assert caught.value.code is ErrorCode.PARSE_FAILURE
+    incomplete = analyze(
+        {
+            "repo_path": str(only_bad),
+            "base_ref": bad_base,
+            "head_ref": bad_head,
+            "output_format": "json",
+        }
+    )
+    assert incomplete["success"] is True
+    assert incomplete["behavior_changes"][0]["category"] == "unknown_semantic_change"
+    assert incomplete["behavior_changes"][0]["evidence"][0]["parser_complete"] is False
+    assert incomplete["scope"]["truncated"] is True
 
 
 def test_handler_always_returns_json_on_llm_failure(repo_factory) -> None:
@@ -129,3 +130,52 @@ def test_minimum_confidence_and_refactor_policies_are_visible(repo_factory) -> N
     )
     assert result["behavior_changes"] == []
     assert any(item["reason"] == "minimum_confidence" for item in result["scope"]["omitted"])
+
+
+def test_every_high_risk_behavior_keeps_a_linked_obligation(repo_factory) -> None:
+    config = "version: 1\ncritical_paths:\n  - pattern: 'critical.py'\n    weight: 100\n"
+    old = "def first(x):\n    return x < 1\n\ndef second(x):\n    return x < 2\n"
+    new = "def first(x):\n    return x <= 1\n\ndef second(x):\n    return x <= 2\n"
+    repo, base, head = repo_factory(
+        {"critical.py": old, ".semantic-diff-weaver.yaml": config},
+        {"critical.py": new, ".semantic-diff-weaver.yaml": config},
+    )
+    result = analyze(
+        {"repo_path": str(repo), "base_ref": base, "head_ref": head, "output_format": "json"}
+    )
+    required = {
+        item["id"] for item in result["behavior_changes"] if item["risk"] in {"high", "critical"}
+    }
+    linked = {
+        behavior_id
+        for obligation in result["test_obligations"]
+        for behavior_id in obligation["behavior_change_ids"]
+    }
+    assert required
+    assert required <= linked
+
+
+def test_critical_path_prioritization_is_explicit_in_canonical_scope(repo_factory) -> None:
+    config = (
+        "version: 1\n"
+        "critical_paths:\n  - pattern: 'critical.py'\n    weight: 100\n"
+        "rules:\n  max_changed_files: 1\n  max_diff_lines: 2\n"
+    )
+    repo, base, head = repo_factory(
+        {
+            "critical.py": "def f(x):\n    return x < 1\n",
+            "other.py": "def g(x):\n    return x < 1\n",
+            ".semantic-diff-weaver.yaml": config,
+        },
+        {
+            "critical.py": "def f(x):\n    return x <= 1\n",
+            "other.py": "def g(x):\n    return x <= 1\n",
+            ".semantic-diff-weaver.yaml": config,
+        },
+    )
+    result = analyze(
+        {"repo_path": str(repo), "base_ref": base, "head_ref": head, "output_format": "json"}
+    )
+    assert result["scope"]["analyzed_files"] == ["critical.py"]
+    assert result["scope"]["truncated"] is True
+    assert any(item["reason"] == "resource_prioritization" for item in result["scope"]["omitted"])

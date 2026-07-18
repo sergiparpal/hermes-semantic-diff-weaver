@@ -1,62 +1,137 @@
 [
   {
     "name": "inclusive boundary",
-    "old": "def allowed(x):\n    return x < 5\n",
-    "new": "def allowed(x):\n    return x <= 5\n",
-    "expected": ["boundary_change"]
+    "old_files": {"src/case.py": "def allowed(x):\n    return x < 5\n"},
+    "new_files": {"src/case.py": "def allowed(x):\n    return x <= 5\n"},
+    "expected": ["boundary_change"],
+    "anchors": [{"path": "src/case.py", "symbol": "allowed", "kind": "comparison_change"}],
+    "obligation_concepts": ["exact changed boundary"]
   },
   {
     "name": "default argument",
-    "old": "def run(limit=2):\n    return limit\n",
-    "new": "def run(limit=3):\n    return limit\n",
-    "expected": ["default_behavior_change"]
+    "old_files": {"src/case.py": "def run(limit=2):\n    return limit\n"},
+    "new_files": {"src/case.py": "def run(limit=3):\n    return limit\n"},
+    "expected": ["default_behavior_change"],
+    "anchors": [{"path": "src/case.py", "symbol": "run", "kind": "signature_change"}],
+    "obligation_concepts": ["omitted-input behavior"]
   },
   {
     "name": "exception type",
-    "old": "def run():\n    raise ValueError()\n",
-    "new": "def run():\n    raise TypeError()\n",
-    "expected": ["error_handling_change"]
+    "old_files": {"src/case.py": "def run():\n    raise ValueError()\n"},
+    "new_files": {"src/case.py": "def run():\n    raise TypeError()\n"},
+    "expected": ["error_handling_change"],
+    "anchors": [{"path": "src/case.py", "symbol": "run", "kind": "raise_change"}],
+    "obligation_concepts": ["failure trigger"]
   },
   {
     "name": "retry predicate",
-    "old": "def retry(attempts):\n    while attempts < 3:\n        attempts += 1\n    return attempts\n",
-    "new": "def retry(attempts):\n    while attempts <= 3:\n        attempts += 1\n    return attempts\n",
-    "expected": ["retry_timeout_change"]
+    "old_files": {"src/case.py": "def retry(attempts):\n    while attempts < 3:\n        attempts += 1\n    return attempts\n"},
+    "new_files": {"src/case.py": "def retry(attempts):\n    while attempts <= 3:\n        attempts += 1\n    return attempts\n"},
+    "expected": ["retry_timeout_change"],
+    "anchors": [{"path": "src/case.py", "symbol": "retry", "kind": "comparison_change"}],
+    "obligation_concepts": ["exact retry or timeout limit"]
   },
   {
     "name": "authorization guard",
-    "old": "def allowed(user):\n    if user.is_admin:\n        return True\n    return False\n",
-    "new": "def allowed(user):\n    if user.is_owner:\n        return True\n    return False\n",
-    "expected": ["authorization_change"]
+    "old_files": {"src/case.py": "def allowed(user):\n    if user.is_admin:\n        return True\n    return False\n"},
+    "new_files": {"src/case.py": "def allowed(user):\n    if user.is_owner:\n        return True\n    return False\n"},
+    "expected": ["authorization_change"],
+    "anchors": [{"path": "src/case.py", "symbol": "allowed", "kind": "condition_change"}],
+    "obligation_concepts": ["denied principal"]
   },
   {
     "name": "output field",
-    "old": "def result():\n    return {'old': 1}\n",
-    "new": "def result():\n    return {'new': 1}\n",
-    "expected": ["output_contract_change"]
+    "old_files": {"src/case.py": "def result():\n    return {'old': 1}\n"},
+    "new_files": {"src/case.py": "def result():\n    return {'new': 1}\n"},
+    "expected": ["output_contract_change"],
+    "anchors": [{"path": "src/case.py", "symbol": "result", "kind": "return_change"}],
+    "obligation_concepts": ["consumer-visible contract"]
   },
   {
     "name": "state assignment",
-    "old": "def move():\n    state = 'old'\n    return state\n",
-    "new": "def move():\n    state = 'new'\n    return state\n",
-    "expected": ["state_transition_change"]
+    "old_files": {"src/case.py": "def move():\n    state = 'old'\n    return state\n"},
+    "new_files": {"src/case.py": "def move():\n    state = 'new'\n    return state\n"},
+    "expected": ["state_transition_change"],
+    "anchors": [{"path": "src/case.py", "symbol": "move", "kind": "assignment_change"}],
+    "obligation_concepts": ["allowed transition"]
   },
   {
     "name": "dependency arguments",
-    "old": "def fetch(client, x):\n    return client.fetch(x)\n",
-    "new": "def fetch(client, x):\n    return client.fetch(x, strict=True)\n",
-    "expected": ["dependency_interaction_change"]
+    "old_files": {"src/case.py": "def fetch(client, x):\n    return client.fetch(x)\n"},
+    "new_files": {"src/case.py": "def fetch(client, x):\n    return client.fetch(x, strict=True)\n"},
+    "expected": ["dependency_interaction_change"],
+    "anchors": [{"path": "src/case.py", "symbol": "fetch", "kind": "call_change"}],
+    "obligation_concepts": ["dependency failure"]
   },
   {
     "name": "side effect",
-    "old": "def finish(user):\n    return user\n",
-    "new": "def finish(user):\n    notify(user)\n    return user\n",
-    "expected": ["side_effect_change"]
+    "old_files": {"src/case.py": "def finish(user):\n    return user\n"},
+    "new_files": {"src/case.py": "def finish(user):\n    notify(user)\n    return user\n"},
+    "expected": ["side_effect_change"],
+    "anchors": [{"path": "src/case.py", "symbol": "finish", "kind": "call_change"}],
+    "obligation_concepts": ["side-effect occurrence"]
   },
   {
     "name": "call ordering",
-    "old": "def run():\n    first()\n    second()\n",
-    "new": "def run():\n    second()\n    first()\n",
-    "expected": ["ordering_change"]
+    "old_files": {"src/case.py": "def run():\n    first()\n    second()\n"},
+    "new_files": {"src/case.py": "def run():\n    second()\n    first()\n"},
+    "expected": ["ordering_change"],
+    "anchors": [{"path": "src/case.py", "symbol": "run", "kind": "call_order_change"}],
+    "obligation_concepts": ["competing conditions"]
+  },
+  {
+    "name": "stable refactor",
+    "old_files": {"src/case.py": "def old_name(x):\n    return x + 1\n"},
+    "new_files": {"src/case.py": "def new_name(x):\n    return x + 1\n"},
+    "expected": [],
+    "anchors": [],
+    "obligation_concepts": [],
+    "expected_omission": "low_risk_refactor_policy"
+  },
+  {
+    "name": "ambiguous metaprogrammed syntax",
+    "old_files": {"src/case.py": "def dynamic(flag):\n    if flag:\n        pass\n"},
+    "new_files": {"src/case.py": "def dynamic(flag):\n    if flag:\n        ...\n"},
+    "expected": ["unknown_semantic_change"],
+    "anchors": [{"path": "src/case.py", "symbol": "dynamic", "kind": "unknown_structure"}],
+    "obligation_concepts": ["clarify and characterize"]
+  },
+  {
+    "name": "moved renamed function",
+    "old_files": {"src/old.py": "def old_name(x):\n    return x + 1\n"},
+    "new_files": {"src/new.py": "def new_name(x):\n    return x + 1\n"},
+    "remove": ["src/old.py"],
+    "expected": [],
+    "anchors": [],
+    "obligation_concepts": [],
+    "expected_omission": "low_risk_refactor_policy"
+  },
+  {
+    "name": "no changed Python source",
+    "old_files": {"README.md": "old purpose\n"},
+    "new_files": {"README.md": "new purpose\n"},
+    "expected": [],
+    "anchors": [],
+    "obligation_concepts": [],
+    "expected_limitation": "no included changed Python source"
+  },
+  {
+    "name": "mixed parseable and unparseable Python",
+    "old_files": {"src/good.py": "def f(x):\n    return x < 2\n", "src/bad.py": "def broken(:\n"},
+    "new_files": {"src/good.py": "def f(x):\n    return x <= 2\n", "src/bad.py": "def broken_again(:\n"},
+    "expected": ["boundary_change", "unknown_semantic_change"],
+    "anchors": [
+      {"path": "src/good.py", "symbol": "f", "kind": "comparison_change"},
+      {"path": "src/bad.py", "symbol": "<unparsed>", "kind": "parse_incomplete"}
+    ],
+    "obligation_concepts": ["exact changed boundary", "clarify and characterize"]
+  },
+  {
+    "name": "oversized critical path prioritization",
+    "generator": "oversized_critical",
+    "expected": ["boundary_change"],
+    "anchors": [{"path": "critical.py", "symbol": "critical", "kind": "comparison_change"}],
+    "obligation_concepts": ["exact changed boundary"],
+    "expected_omission": "resource_prioritization"
   }
 ]

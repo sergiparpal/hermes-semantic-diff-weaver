@@ -9,7 +9,13 @@ from .models import AnalysisResult, BothEnvelope, MarkdownEnvelope, OutputFormat
 
 
 def _escape(text: str) -> str:
-    return re.sub(r"([\\`*_{}\[\]()<>#+.!|~-])", r"\\\1", text)
+    controlled = text.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+    return re.sub(r"([\\`*_{}\[\]()<>#+.!|~-])", r"\\\1", controlled)
+
+
+def _fenced_summary(label: str, text: str) -> list[str]:
+    safe = text.replace("`", "'").replace("\r", "\\r").replace("\t", "\\t")
+    return [f"    {label}: {line}" for line in safe.splitlines() or [""]]
 
 
 def render_markdown(result: AnalysisResult) -> str:
@@ -22,9 +28,12 @@ def render_markdown(result: AnalysisResult) -> str:
             f"{result.summary.overall_confidence:.0%}"
         ),
         (
-            f"**Scope:** {len(result.scope.analyzed_files)} analyzed file(s), "
+            f"**Scope:** {len(result.scope.analyzed_files)}/{result.scope.changed_files_total} "
+            "changed file(s) analyzed, "
             f"{result.summary.changed_symbols} changed symbol(s), "
-            f"{sum(item.count for item in result.scope.omitted)} omitted item(s)."
+            f"{sum(item.count for item in result.scope.omitted)} omitted item(s), "
+            f"{sum(result.scope.excluded_counts.values())} excluded file(s)"
+            f"{' (truncated)' if result.scope.truncated else ''}."
         ),
         "",
         "### Inferred behavior changes",
@@ -49,12 +58,16 @@ def render_markdown(result: AnalysisResult) -> str:
             location = _escape(evidence.path)
             if evidence.symbol:
                 location += f" — `{_escape(evidence.symbol)}`"
-            delta = " → ".join(
-                f"`{_escape(item)}`" for item in (evidence.old, evidence.new) if item
-            )
-            lines.append(
-                f"  - Evidence `{evidence.id}`: {location}{f' — {delta}' if delta else ''}"
-            )
+            ranges = []
+            if evidence.old_lines:
+                ranges.append(f"old {evidence.old_lines.start}-{evidence.old_lines.end}")
+            if evidence.new_lines:
+                ranges.append(f"new {evidence.new_lines.start}-{evidence.new_lines.end}")
+            suffix = f" ({', '.join(ranges)})" if ranges else ""
+            lines.append(f"  - Evidence `{evidence.id}`: {location}{suffix}")
+            if evidence.old or evidence.new:
+                lines.extend(["    ````text", *_fenced_summary("old", evidence.old or "∅")])
+                lines.extend([*_fenced_summary("new", evidence.new or "∅"), "    ````"])
     lines.extend(["", "### Prioritized test obligations", ""])
     if not result.test_obligations:
         lines.append("No test obligations were generated.")
@@ -69,7 +82,8 @@ def render_markdown(result: AnalysisResult) -> str:
         )
         if obligation.candidate_existing_tests:
             candidates = ", ".join(
-                f"`{_escape(item.path)}::{_escape(item.symbol)}` ({item.match_score:.2f})"
+                f"`{_escape(item.path)}::{_escape(item.symbol)}` ({item.match_score:.2f}; "
+                f"{_escape(', '.join(item.match_reasons))})"
                 for item in obligation.candidate_existing_tests
             )
             lines.append(f"  - Candidate existing tests (unverified): {candidates}")

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import ast
 import hashlib
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import Any
 
 from .git_diff import ChangedFile, Hunk
@@ -33,16 +34,26 @@ def _call_name(node: ast.AST) -> str:
 
 
 def _body_fingerprint(body: list[ast.stmt]) -> str:
-    material = body
-    if (
-        material
-        and isinstance(material[0], ast.Expr)
-        and isinstance(material[0].value, ast.Constant)
-        and isinstance(material[0].value.value, str)
-    ):
-        material = material[1:]
+    material = _behavior_body(body)
     dump = ast.dump(ast.Module(body=material, type_ignores=[]), include_attributes=False)
     return hashlib.sha256(dump.encode("utf-8")).hexdigest()
+
+
+def _behavior_body(body: list[ast.stmt]) -> list[ast.stmt]:
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        return body[1:]
+    return body
+
+
+def _node_inventory(body: list[ast.stmt]) -> tuple[tuple[str, int], ...]:
+    module = ast.Module(body=_behavior_body(body), type_ignores=[])
+    counts = Counter(type(node).__name__ for node in ast.walk(module))
+    return tuple(sorted(counts.items()))
 
 
 class FeatureVisitor(ast.NodeVisitor):
@@ -174,6 +185,7 @@ class SymbolSnapshot:
     fingerprint: str
     features: dict[str, tuple[tuple[str, int], ...]]
     statement_order: tuple[str, ...]
+    node_inventory: tuple[tuple[str, int], ...]
 
     @property
     def signature_shape(self) -> str:
@@ -247,6 +259,7 @@ def _snapshot(node: ast.AST, qualified_name: str, kind: str) -> SymbolSnapshot:
         fingerprint=_body_fingerprint(body),
         features={name: tuple(getattr(visitor, name)) for name in feature_names},
         statement_order=tuple(visitor.statement_order),
+        node_inventory=_node_inventory(body),
     )
 
 
@@ -505,6 +518,7 @@ def _compare_symbol(
                 "structural_refactor",
                 old.qualified_name,
                 new.qualified_name,
+                materiality=round(max(0.0, 1.0 - _symbol_similarity(old, new)), 3),
             )
         )
     elif old.fingerprint != new.fingerprint and not result:
@@ -512,6 +526,53 @@ def _compare_symbol(
             _delta(path, old, new, hunk_id, "unknown_structure", "body changed", "body changed")
         )
     return result
+
+
+def _multiset_similarity(
+    left: tuple[tuple[str, int], ...], right: tuple[tuple[str, int], ...]
+) -> float:
+    left_counts = dict(left)
+    right_counts = dict(right)
+    keys = left_counts.keys() | right_counts.keys()
+    total = sum(max(left_counts.get(key, 0), right_counts.get(key, 0)) for key in keys)
+    if total == 0:
+        return 1.0
+    overlap = sum(min(left_counts.get(key, 0), right_counts.get(key, 0)) for key in keys)
+    return overlap / total
+
+
+def _set_similarity(left: set[str], right: set[str]) -> float:
+    if not left and not right:
+        return 1.0
+    return len(left & right) / len(left | right)
+
+
+def _symbol_similarity(old: SymbolSnapshot, new: SymbolSnapshot) -> float:
+    if old.kind != new.kind:
+        return 0.0
+    old_parent = old.qualified_name.rpartition(".")[0]
+    new_parent = new.qualified_name.rpartition(".")[0]
+    signature = SequenceMatcher(None, old.signature_shape, new.signature_shape).ratio()
+    calls = _set_similarity(
+        {value.split("(", 1)[0] for value, _ in old.features["calls"]},
+        {value.split("(", 1)[0] for value, _ in new.features["calls"]},
+    )
+    old_feature_counts = tuple(sorted((name, len(values)) for name, values in old.features.items()))
+    new_feature_counts = tuple(sorted((name, len(values)) for name, values in new.features.items()))
+    order = _set_similarity(
+        {item.split(":", 1)[0] for item in old.statement_order},
+        {item.split(":", 1)[0] for item in new.statement_order},
+    )
+    return min(
+        1.0,
+        signature * 0.20
+        + (0.10 if old_parent == new_parent else 0.0)
+        + _multiset_similarity(old.node_inventory, new.node_inventory) * 0.25
+        + calls * 0.15
+        + _multiset_similarity(old_feature_counts, new_feature_counts) * 0.15
+        + order * 0.10
+        + (0.05 if old.fingerprint == new.fingerprint else 0.0),
+    )
 
 
 def _match_symbols(
@@ -527,14 +588,23 @@ def _match_symbols(
         pairs.append((old_by_name[name], new_by_name[name]))
         matched_old.add(name)
         matched_new.add(name)
-    remaining_old = [item for item in old_symbols if item.qualified_name not in matched_old]
-    remaining_new = [item for item in new_symbols if item.qualified_name not in matched_new]
+    remaining_old = sorted(
+        (item for item in old_symbols if item.qualified_name not in matched_old),
+        key=lambda item: item.qualified_name,
+    )
+    remaining_new = sorted(
+        (item for item in new_symbols if item.qualified_name not in matched_new),
+        key=lambda item: item.qualified_name,
+    )
     candidates: dict[str, list[SymbolSnapshot]] = defaultdict(list)
     for item in remaining_new:
         candidates[f"{item.kind}:{item.signature_shape}:{item.fingerprint}"].append(item)
+    unresolved: list[SymbolSnapshot] = []
     for old in remaining_old:
         key = f"{old.kind}:{old.signature_shape}:{old.fingerprint}"
-        possible = candidates.get(key, [])
+        possible = [
+            item for item in candidates.get(key, []) if item.qualified_name not in matched_new
+        ]
         if len(possible) == 1:
             new = possible[0]
             pairs.append((old, new))
@@ -545,7 +615,29 @@ def _match_symbols(
             )
             pairs.append((old, None))
         else:
+            unresolved.append(old)
+    for old in unresolved:
+        scored = sorted(
+            (
+                (_symbol_similarity(old, new), new)
+                for new in remaining_new
+                if new.qualified_name not in matched_new
+            ),
+            key=lambda item: (-item[0], item[1].qualified_name),
+        )
+        plausible = [item for item in scored if item[0] >= 0.82]
+        if not plausible:
             pairs.append((old, None))
+            continue
+        if len(plausible) > 1 and plausible[0][0] - plausible[1][0] <= 0.03:
+            warnings.append(
+                f"Ambiguous similarity match for {old.qualified_name!r}; treated conservatively."
+            )
+            pairs.append((old, None))
+            continue
+        new = plausible[0][1]
+        pairs.append((old, new))
+        matched_new.add(new.qualified_name)
     for new in remaining_new:
         if new.qualified_name not in matched_new:
             pairs.append((None, new))
@@ -568,6 +660,38 @@ def analyze_ast(files: list[ChangedFile]) -> AstAnalysis:
             warnings.append(
                 f"Could not parse changed Python source {path!r}; analysis is incomplete."
             )
+            hunk = changed.hunks[0] if changed.hunks else None
+            old_lines = (
+                LineRange(
+                    start=max(1, hunk.old_start),
+                    end=max(1, hunk.old_start + max(1, hunk.old_count) - 1),
+                )
+                if hunk
+                else None
+            )
+            new_lines = (
+                LineRange(
+                    start=max(1, hunk.new_start),
+                    end=max(1, hunk.new_start + max(1, hunk.new_count) - 1),
+                )
+                if hunk
+                else None
+            )
+            deltas.append(
+                StructuralDelta(
+                    path=path,
+                    symbol="<unparsed>",
+                    kind="parse_incomplete",
+                    old="Committed Python syntax could not be parsed",
+                    new="Committed Python syntax could not be parsed",
+                    old_lines=old_lines,
+                    new_lines=new_lines,
+                    hunk_id=f"{path}#{hunk.id}" if hunk else None,
+                    parser_complete=False,
+                    metadata={"parse_failure": True},
+                )
+            )
+            changed_symbol_keys.add((path, "<unparsed>"))
             continue
         parsed_files += 1
         pairs, match_warnings = _match_symbols(old_symbols, new_symbols)

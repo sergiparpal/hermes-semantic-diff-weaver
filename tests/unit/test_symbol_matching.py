@@ -35,3 +35,11 @@ def test_ambiguous_rename_is_not_forced() -> None:
     assert result.warnings
     assert any(item.kind == "symbol_removed" for item in result.deltas)
     assert sum(item.kind == "symbol_added" for item in result.deltas) == 2
+
+
+def test_conservative_similarity_matches_a_rename_with_a_small_body_change() -> None:
+    result = analyze_ast(
+        [file("def old_name(x):\n    return x + 1\n", "def new_name(x):\n    return x + 2\n")]
+    )
+    assert any(item.kind == "return_change" for item in result.deltas)
+    assert not any(item.kind in {"symbol_added", "symbol_removed"} for item in result.deltas)

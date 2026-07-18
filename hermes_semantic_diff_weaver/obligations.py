@@ -286,7 +286,7 @@ def generate_obligations(
     llm_suggestions: list[SuggestedScenario] | None = None,
 ) -> tuple[list[TestObligation], int]:
     generated: list[TestObligation] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     for behavior in behaviors:
         candidates = candidate_tests.get(behavior.id, [])
         if candidates:
@@ -328,7 +328,12 @@ def generate_obligations(
                 *scenarios[: max(0, config.rules.max_obligations_per_behavior - 1)],
             )
         for scenario in scenarios:
-            key = (_normal(scenario.given), _normal(scenario.when), _normal(scenario.then))
+            key = (
+                behavior.id,
+                _normal(scenario.given),
+                _normal(scenario.when),
+                _normal(scenario.then),
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -351,9 +356,51 @@ def generate_obligations(
                     confidence=behavior.confidence,
                 )
             )
-    generated.sort(key=lambda item: (-item.priority, item.behavior_change_ids[0], item.title))
-    omitted = max(0, len(generated) - config.rules.max_test_obligations)
-    generated = generated[: config.rules.max_test_obligations]
-    for index, obligation in enumerate(generated, start=1):
+    ordered = sorted(
+        generated, key=lambda item: (-item.priority, item.behavior_change_ids[0], item.title)
+    )
+    maximum = config.rules.max_test_obligations
+    required_behaviors = [
+        behavior for behavior in behaviors if behavior.risk.value in {"high", "critical"}
+    ]
+    required: list[TestObligation] = []
+    for behavior in required_behaviors:
+        obligation = next(item for item in ordered if behavior.id in item.behavior_change_ids)
+        if obligation not in required:
+            required.append(obligation)
+    if len(required) > maximum:
+        individually_kept = required[: max(0, maximum - 1)]
+        overflow_ids = sorted(
+            {
+                behavior_id
+                for obligation in required[max(0, maximum - 1) :]
+                for behavior_id in obligation.behavior_change_ids
+            }
+        )
+        overflow_behaviors = [
+            behavior for behavior in required_behaviors if behavior.id in overflow_ids
+        ]
+        grouped = TestObligation(
+            id="to-000",
+            behavior_change_ids=overflow_ids,
+            type=ObligationType.REVIEW,
+            priority=max(item.risk_score for item in overflow_behaviors),
+            title="Review remaining high-risk behavior changes",
+            given="Multiple high-risk behavior changes exceed the individual obligation cap",
+            when="The bounded review is planned",
+            then="Each linked behavior receives an explicit regression scenario before release",
+            candidate_existing_tests=[],
+            coverage_status=CoverageStatus.NONE_FOUND,
+            origin=overflow_behaviors[0].origin,
+            confidence=min(item.confidence for item in overflow_behaviors),
+        )
+        selected = [*individually_kept, grouped]
+    else:
+        selected = list(required)
+        selected.extend(item for item in ordered if item not in selected)
+        selected = selected[:maximum]
+    omitted = max(0, len(generated) - min(maximum, len(generated)))
+    selected.sort(key=lambda item: (-item.priority, item.behavior_change_ids[0], item.title))
+    for index, obligation in enumerate(selected, start=1):
         obligation.id = f"to-{index:03d}"
-    return generated, omitted
+    return selected, omitted

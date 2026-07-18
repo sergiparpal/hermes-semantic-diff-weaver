@@ -9,6 +9,7 @@ from hermes_semantic_diff_weaver.models import (
     BehaviorCategory,
     CandidateTest,
     ErrorResponse,
+    Evidence,
     LineRange,
     WeaverConfig,
 )
@@ -62,3 +63,16 @@ def test_candidate_tests_are_explicitly_unverified() -> None:
 def test_transport_schemas_are_versioned() -> None:
     assert AnalysisResult.model_json_schema()["properties"]["schema_version"]["const"] == "1.0"
     assert ErrorResponse(success=False, error="invalid_ref", message="bad", remediation="fix")
+
+
+@pytest.mark.parametrize(
+    "path", ["../test_api.py", "/tmp/test_api.py", "C:/test_api.py", "a\\b.py"]
+)
+def test_output_paths_must_be_repository_relative_posix(path: str) -> None:
+    with pytest.raises(ValidationError):
+        Evidence(id="ev-001", path=path, kind="change")
+
+
+def test_error_response_rejects_unknown_public_code() -> None:
+    with pytest.raises(ValidationError):
+        ErrorResponse(success=False, error="invented", message="bad", remediation="fix")

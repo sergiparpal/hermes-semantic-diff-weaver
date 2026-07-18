@@ -24,8 +24,10 @@ from .models import (
     RiskLabel,
     ScopeMetadata,
     Summary,
+    WeaverConfig,
 )
 from .obligations import generate_obligations
+from .path_policy import glob_matches, redact_text
 from .renderer import render_transport
 from .scoring import confidence_score, score_risk
 from .semantic_candidates import SemanticCandidate, build_candidates
@@ -43,7 +45,7 @@ def _validation_error(exc: ValidationError) -> WeaverError:
 
 
 def _prioritize_deltas(
-    deltas: list[StructuralDelta], maximum: int
+    deltas: list[StructuralDelta], maximum: int, config: WeaverConfig
 ) -> tuple[list[StructuralDelta], int]:
     grouped: dict[tuple[str, str], list[StructuralDelta]] = defaultdict(list)
     for delta in deltas:
@@ -51,6 +53,14 @@ def _prioritize_deltas(
     ordered = sorted(
         grouped.items(),
         key=lambda item: (
+            -max(
+                (
+                    critical.weight
+                    for critical in config.critical_paths
+                    if glob_matches(item[0][0], critical.pattern)
+                ),
+                default=0,
+            ),
             -sum(
                 delta.kind
                 in {
@@ -66,6 +76,30 @@ def _prioritize_deltas(
     )
     selected = ordered[:maximum]
     return [delta for _, items in selected for delta in items], max(0, len(ordered) - maximum)
+
+
+def _read_readme_excerpt(repo: GitRepository, head_commit: str, config: WeaverConfig) -> str | None:
+    if config.rules.max_readme_chars == 0:
+        return None
+    readme = next(
+        (
+            path
+            for path in repo.list_files(head_commit)
+            if path.rsplit("/", 1)[-1].casefold()
+            in {"readme", "readme.md", "readme.rst", "readme.txt"}
+        ),
+        None,
+    )
+    if readme is None:
+        return None
+    source = repo.read_blob(
+        head_commit,
+        readme,
+        min(config.rules.max_file_bytes, max(4096, config.rules.max_readme_chars * 4)),
+    )
+    if source is None:
+        return None
+    return redact_text(source, max_chars=config.rules.max_readme_chars)
 
 
 def _deduplicate_candidates(candidates: list[SemanticCandidate]) -> list[SemanticCandidate]:
@@ -106,23 +140,50 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
     config, config_warnings = load_config(repo.root, request)
     collection = collect_diff(repo, base_commit, head_commit, config)
     ast_result = analyze_ast(collection.files)
-    if collection.files and ast_result.parsed_files == 0:
+    if collection.files and not ast_result.deltas:
         raise WeaverError(
             ErrorCode.PARSE_FAILURE,
             "No changed Python source could be parsed into meaningful structural evidence.",
             "Fix syntax errors, narrow the scope, or analyze commits containing parseable Python.",
         )
-    omitted: list[OmittedScope] = []
-    truncated = False
+    omitted = [
+        OmittedScope(reason=reason, count=count)
+        for reason, count in sorted(collection.omitted_counts.items())
+        if count
+    ]
+    scope_truncated = collection.truncated
+    confidence_truncated = collection.truncated
+    if ast_result.failed_files:
+        omitted.append(OmittedScope(reason="parse_incomplete_files", count=ast_result.failed_files))
+        scope_truncated = True
     deltas = ast_result.deltas
     changed_symbols = ast_result.changed_symbols
     if changed_symbols > config.rules.max_changed_symbols:
-        deltas, omitted_count = _prioritize_deltas(deltas, config.rules.max_changed_symbols)
+        deltas, omitted_count = _prioritize_deltas(deltas, config.rules.max_changed_symbols, config)
         omitted.append(OmittedScope(reason="changed_symbol_limit", count=omitted_count))
         changed_symbols = config.rules.max_changed_symbols
-        truncated = True
-    deterministic = build_candidates(deltas)
-    interpreted = interpret_candidates(deterministic, llm, config)
+        scope_truncated = True
+        confidence_truncated = True
+    deterministic = build_candidates(deltas, config)
+    interpreted = interpret_candidates(
+        deterministic,
+        llm,
+        config,
+        readme_excerpt=_read_readme_excerpt(repo, head_commit, config),
+    )
+    if interpreted.omitted_batches:
+        omitted.append(OmittedScope(reason="llm_batch_limit", count=interpreted.omitted_batches))
+        scope_truncated = True
+        confidence_truncated = True
+    if interpreted.truncated_evidence_symbols:
+        omitted.append(
+            OmittedScope(
+                reason="model_evidence_limit",
+                count=interpreted.truncated_evidence_symbols,
+            )
+        )
+        scope_truncated = True
+        confidence_truncated = True
     candidates = _deduplicate_candidates(interpreted.candidates)
     reportable: list[SemanticCandidate] = []
     confidence_by_index: dict[int, float] = {}
@@ -135,7 +196,7 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
     low_confidence_omitted = 0
     refactors_omitted = 0
     for candidate in candidates:
-        confidence = confidence_score(candidate, truncated=truncated)
+        confidence = confidence_score(candidate, truncated=confidence_truncated)
         if (
             candidate.category.value == "refactor_likely_no_behavior_change"
             and not config.rules.emit_low_risk_refactors
@@ -234,6 +295,16 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
         limitations.append(
             f"{low_confidence_omitted} low-confidence finding(s) were not presented as facts."
         )
+    if ast_result.failed_files:
+        limitations.append(
+            f"{ast_result.failed_files} changed Python file(s) had incomplete parser context."
+        )
+    if collection.truncated:
+        limitations.append(
+            "Only prioritized critical-path scope was analyzed due to resource limits."
+        )
+    if interpreted.omitted_batches or interpreted.truncated_evidence_symbols:
+        limitations.append("Some optional model interpretation context was omitted or truncated.")
     if fallback_mode and deterministic:
         limitations.append("LLM interpretation was unavailable; deterministic fallback was used.")
     analysis = AnalysisResult(
@@ -261,7 +332,7 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
             omitted=omitted,
             changed_lines=collection.changed_lines,
             changed_symbols=changed_symbols,
-            truncated=truncated or bool(omitted_obligations),
+            truncated=scope_truncated or bool(omitted_obligations),
         ),
         behavior_changes=behaviors,
         test_obligations=obligations,

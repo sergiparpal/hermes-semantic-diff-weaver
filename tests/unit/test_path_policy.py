@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import hermes_semantic_diff_weaver.path_policy as path_policy
 from hermes_semantic_diff_weaver.errors import WeaverError
 from hermes_semantic_diff_weaver.path_policy import (
     ensure_contained,
@@ -16,7 +17,7 @@ from hermes_semantic_diff_weaver.path_policy import (
 
 @pytest.mark.parametrize(
     "path",
-    ["../escape.py", "/etc/passwd", "C:\\outside\\file.py", ".git/config", "line\nbreak.py"],
+    ["../escape.py", "/etc/passwd", "C:\\outside\\file.py", ".git/config", "nul\x00.py"],
 )
 def test_untrusted_paths_are_rejected(path: str) -> None:
     with pytest.raises(WeaverError):
@@ -25,6 +26,7 @@ def test_untrusted_paths_are_rejected(path: str) -> None:
 
 def test_paths_normalize_and_globs_match_root() -> None:
     assert normalize_repo_path("src\\api.py") == "src/api.py"
+    assert normalize_repo_path("line\nbreak.py") == "line\nbreak.py"
     assert glob_matches("api.py", "**/*.py")
     assert glob_matches("src/api.py", "**/*.py")
 
@@ -37,6 +39,8 @@ def test_paths_normalize_and_globs_match_root() -> None:
         ("certs/client.pem", "secret_filename"),
         (".venv/lib.py", "cache_or_environment"),
         (".git/config", "control_directory"),
+        ("config/access_token.json", "secret_filename"),
+        ("config/passwords.toml", "secret_filename"),
     ],
 )
 def test_mandatory_exclusions(path: str, reason: str) -> None:
@@ -58,3 +62,12 @@ def test_resolved_containment_accepts_inside_and_rejects_outside(tmp_path: Path)
     outside.write_text("x = 2\n", encoding="utf-8")
     with pytest.raises(WeaverError):
         ensure_contained(tmp_path, outside)
+
+
+def test_non_secret_token_source_and_windows_devices_are_handled(
+    monkeypatch,
+) -> None:
+    assert exclusion_reason("src/token.py") is None
+    monkeypatch.setattr(path_policy.os, "name", "nt")
+    with pytest.raises(WeaverError):
+        normalize_repo_path("CON.py")

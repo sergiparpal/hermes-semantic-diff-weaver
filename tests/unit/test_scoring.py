@@ -74,6 +74,20 @@ def test_candidate_never_removes_test_gap() -> None:
     assert explanation.test_gap_weight > 0
 
 
+def test_private_symbols_and_weak_candidates_adjust_risk_components() -> None:
+    candidate = authorization_candidate()
+    candidate.evidence[0].symbol = "_authorize"
+    weak = CandidateTest(
+        path="tests/auth/test_policy.py",
+        symbol="test_authorize",
+        match_score=0.5,
+        match_reasons=["mirrored source/test path"],
+    )
+    _, _, explanation = score_risk(candidate, [weak], WeaverConfig())
+    assert explanation.behavioral_impact < 92
+    assert explanation.test_gap_weight == 65
+
+
 def test_confidence_is_independent_and_truncation_penalizes() -> None:
     candidate = authorization_candidate()
     assert confidence_score(candidate, truncated=True) < confidence_score(

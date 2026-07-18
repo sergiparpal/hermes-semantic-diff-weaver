@@ -28,3 +28,25 @@ def test_unknown_taxonomy_fails_local_validation_and_preserves_deterministic() -
     assert len(result.candidates) == 1
     assert result.status.failures == 1
     assert result.candidates[0].category is BehaviorCategory.BOUNDARY
+
+
+def test_evidence_from_another_batch_is_rejected_for_that_batch() -> None:
+    first = candidate()
+    second = candidate()
+    second.evidence[0].id = "ev-002"
+    second.evidence[0].path = "src/second.py"
+    payload = valid_payload()
+    payload["behaviors"][0]["evidence_ids"] = ["ev-002"]
+    result = interpret_candidates(
+        [first, second],
+        FakeLlm([Result("json", payload)]),
+        WeaverConfig(),
+    )
+    assert any("outside its supplied batch" in item for item in result.warnings)
+
+
+def test_per_symbol_behavior_cap_is_enforced() -> None:
+    payload = valid_payload()
+    payload["behaviors"] = payload["behaviors"] * 4
+    result = interpret_candidates([candidate()], FakeLlm([Result("json", payload)]), WeaverConfig())
+    assert any("per-symbol behavior cap" in item for item in result.warnings)

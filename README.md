@@ -14,7 +14,8 @@ degrades to deterministic structural findings when the Hermes-hosted model is un
 - Python 3.11 or later.
 - Git available on `PATH`.
 - Pydantic 2 and PyYAML 6 (installed with the package).
-- A compatible Hermes Agent installation for plugin discovery and optional structured LLM inference.
+- Hermes Agent 0.14.0 or later for plugin discovery and optional structured LLM inference. The
+  package deliberately does not force-install Hermes or constrain its version in metadata.
 
 ## Install and enable
 
@@ -98,9 +99,14 @@ python -m pytest tests/unit tests/contract
 python -m pytest tests/integration
 python -m pytest tests/security
 python -m pytest tests/evaluation
+python -m pytest tests/performance
+python -m pytest --cov=hermes_semantic_diff_weaver --cov-branch --cov-report=json:coverage.json
+python scripts/check_coverage.py coverage.json
 python -m ruff check .
 python -m ruff format --check .
 python -m build
+python scripts/verify_wheel.py dist
+python scripts/verify_hermes.py  # with Hermes >=0.14.0 and the wheel installed
 ```
 
 Tests use temporary Git repositories and fake Hermes contexts/models. They do not change the real
@@ -115,5 +121,6 @@ Hermes home and do not require a paid or live LLM.
   changes.
 - No network ref lookup, pull-request API integration, test execution, or test generation.
 
-This repository intentionally does not invent a license. Choosing and adding a license remains a
-release/publishing decision; local implementation, tests, and artifact builds remain available.
+## License
+
+Licensed under the [MIT License](LICENSE).
