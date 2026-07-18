@@ -1,0 +1,119 @@
+# Hermes Semantic Diff Weaver
+
+Hermes Semantic Diff Weaver is an advisory, read-only Hermes Agent plugin for reviewing a bounded
+Git diff between two committed revisions. It statically extracts Python structural changes, infers
+evidence-backed behavior changes, ranks risk separately from confidence, and produces concrete test
+obligations plus unverified candidate existing tests.
+
+The plugin never imports, executes, builds, installs, tests, or modifies the analyzed repository. It
+does not claim runtime coverage. Repository content is treated as untrusted data, and the analysis
+degrades to deterministic structural findings when the Hermes-hosted model is unavailable.
+
+## Requirements
+
+- Python 3.11 or later.
+- Git available on `PATH`.
+- Pydantic 2 and PyYAML 6 (installed with the package).
+- A compatible Hermes Agent installation for plugin discovery and optional structured LLM inference.
+
+## Install and enable
+
+For development as a user directory plugin, copy this repository directory to:
+
+```text
+~/.hermes/plugins/hermes-semantic-diff-weaver/
+```
+
+For a project plugin, copy it to `.hermes/plugins/hermes-semantic-diff-weaver/` and explicitly trust
+project plugin discovery:
+
+```text
+HERMES_ENABLE_PROJECT_PLUGINS=true
+```
+
+For package installation:
+
+```text
+python -m pip install .
+hermes plugins enable hermes-semantic-diff-weaver
+hermes plugins list
+```
+
+Plugins are opt-in. Set `HERMES_PLUGINS_DEBUG=1` and inspect the Hermes plugin logs if discovery or
+registration fails. The package exposes the `hermes_agent.plugins` entry point and the directory
+contains both `plugin.yaml` and a root `__init__.py`.
+
+## Tool input
+
+Hermes registers exactly one tool, `analyze_semantic_diff`:
+
+```json
+{
+  "repo_path": "/path/to/local/repository",
+  "base_ref": "main",
+  "head_ref": "HEAD",
+  "include": ["src/**/*.py"],
+  "exclude": ["**/generated/**"],
+  "output_format": "both"
+}
+```
+
+`repo_path` and `base_ref` are required. `head_ref` defaults to `HEAD`; `output_format` may be
+`json`, `markdown`, or `both`. An optional `risk_profile` may name a bounded YAML file explicitly.
+Unknown arguments are rejected.
+
+The handler always returns a JSON-encoded string. JSON mode returns the canonical schema-versioned
+analysis. Markdown mode returns a JSON envelope containing the PR-ready brief. Both mode returns the
+canonical analysis and matching Markdown together.
+
+## Configuration
+
+All configuration is optional. Precedence is tool arguments, explicit risk profile,
+`.hermes/semantic-diff-weaver.yaml`, `.semantic-diff-weaver.yaml`, and built-in conservative
+defaults. See [configuration](docs/configuration.md) for the full schema and limits.
+
+Minimal example:
+
+```yaml
+version: 1
+paths:
+  include: ["src/**/*.py"]
+  test_roots: ["tests"]
+critical_paths:
+  - pattern: "src/auth/**"
+    weight: 90
+rules:
+  minimum_report_confidence: 0.45
+  deterministic_fallback: true
+```
+
+Mandatory secret and control-directory exclusions cannot be disabled. Configuration cannot enable
+network access, code execution, or paths outside the repository boundary.
+
+## Development gates
+
+```text
+python -m pytest
+python -m pytest tests/unit tests/contract
+python -m pytest tests/integration
+python -m pytest tests/security
+python -m pytest tests/evaluation
+python -m ruff check .
+python -m ruff format --check .
+python -m build
+```
+
+Tests use temporary Git repositories and fake Hermes contexts/models. They do not change the real
+Hermes home and do not require a paid or live LLM.
+
+## Limitations
+
+- Python source and common pytest/unittest layouts only.
+- Committed base/head content only; staged and working-tree changes are outside the MVP.
+- Static candidates are not verified coverage.
+- Dynamic metaprogramming and external contracts may produce review questions or unknown semantic
+  changes.
+- No network ref lookup, pull-request API integration, test execution, or test generation.
+
+This repository intentionally does not invent a license. Choosing and adding a license remains a
+release/publishing decision; local implementation, tests, and artifact builds remain available.

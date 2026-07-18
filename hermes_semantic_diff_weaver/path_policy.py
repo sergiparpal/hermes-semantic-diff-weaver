@@ -1,0 +1,136 @@
+"""Repository containment, path filtering, and secret redaction policy."""
+
+from __future__ import annotations
+
+import fnmatch
+import os
+import re
+from pathlib import Path, PurePosixPath, PureWindowsPath
+
+from .errors import ErrorCode, WeaverError
+
+CONTROL_PARTS = {".git", ".hg", ".svn", ".bzr"}
+CACHE_PARTS = {
+    ".cache",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "node_modules",
+}
+SECRET_NAMES = {
+    ".env",
+    ".netrc",
+    "credentials",
+    "credentials.json",
+    "git-credentials",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_rsa",
+    "secrets.yml",
+    "secrets.yaml",
+}
+SECRET_SUFFIXES = {".jks", ".key", ".keystore", ".p12", ".pem", ".pfx"}
+WINDOWS_RESERVED = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+REDACTIONS = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,})\b"),
+    re.compile(
+        r"(?i)\b(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*['\"]?[^\s'\"]{8,}"
+    ),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+)
+
+
+def path_error(message: str) -> WeaverError:
+    return WeaverError(
+        ErrorCode.PATH_OUTSIDE_REPOSITORY,
+        message,
+        "Use a repository-relative path that remains inside the resolved Git repository.",
+    )
+
+
+def normalize_repo_path(value: str) -> str:
+    """Validate an untrusted repository-relative path and normalize it to POSIX form."""
+    if not value or "\x00" in value or "\r" in value or "\n" in value:
+        raise path_error("Git returned an empty or invalid repository path.")
+    normalized = value.replace("\\", "/")
+    posix = PurePosixPath(normalized)
+    windows = PureWindowsPath(value)
+    if posix.is_absolute() or windows.is_absolute() or windows.drive:
+        raise path_error("An absolute or drive-relative repository path was rejected.")
+    if ".." in posix.parts or any(part in {"", "."} for part in posix.parts):
+        raise path_error("A repository path containing traversal was rejected.")
+    if any(part.casefold() in CONTROL_PARTS for part in posix.parts):
+        raise path_error("A version-control metadata path was rejected.")
+    if os.name == "nt" and any(
+        part.rstrip(". ").split(".", 1)[0].upper() in WINDOWS_RESERVED for part in posix.parts
+    ):
+        raise path_error("A reserved Windows device path was rejected.")
+    return posix.as_posix()
+
+
+def ensure_contained(root: Path, candidate: Path) -> Path:
+    """Resolve a path and require it to remain within root (case-aware by platform)."""
+    resolved_root = root.resolve(strict=True)
+    resolved_candidate = candidate.resolve(strict=True)
+    try:
+        resolved_candidate.relative_to(resolved_root)
+    except ValueError as exc:
+        raise path_error("The resolved path is outside the Git repository.") from exc
+    return resolved_candidate
+
+
+def exclusion_reason(path: str) -> str | None:
+    """Return a mandatory exclusion class without echoing a sensitive filename."""
+    parts = [part.casefold() for part in PurePosixPath(path).parts]
+    name = parts[-1]
+    suffix = PurePosixPath(name).suffix.casefold()
+    if any(part in CONTROL_PARTS for part in parts):
+        return "control_directory"
+    if any(part in CACHE_PARTS for part in parts):
+        return "cache_or_environment"
+    if name == ".env" or name.startswith(".env."):
+        return "secret_filename"
+    if name in SECRET_NAMES or suffix in SECRET_SUFFIXES:
+        return "secret_filename"
+    if any(token in name for token in ("credential", "password", "private_key")):
+        return "secret_filename"
+    if "secret" in name and suffix in {".json", ".toml", ".yaml", ".yml", ".ini", ".cfg"}:
+        return "secret_filename"
+    return None
+
+
+def glob_matches(path: str, pattern: str) -> bool:
+    """Cross-platform repository glob matching with intuitive ** root behavior."""
+    normalized = pattern.replace("\\", "/").lstrip("./")
+    if fnmatch.fnmatchcase(path, normalized):
+        return True
+    if normalized.startswith("**/") and fnmatch.fnmatchcase(path, normalized[3:]):
+        return True
+    return False
+
+
+def is_included(path: str, includes: list[str], excludes: list[str]) -> bool:
+    return any(glob_matches(path, item) for item in includes) and not any(
+        glob_matches(path, item) for item in excludes
+    )
+
+
+def redact_text(text: str, *, max_chars: int = 2000) -> str:
+    """Bound and redact obvious credentials before evidence leaves preprocessing."""
+    bounded = text[:max_chars]
+    for pattern in REDACTIONS:
+        bounded = pattern.sub("[REDACTED]", bounded)
+    return bounded
