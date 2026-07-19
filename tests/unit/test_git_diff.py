@@ -39,7 +39,7 @@ def test_git_boundary_rejects_a_filesystem_root_and_invalid_resolver_output(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setattr(shutil, "which", lambda _: "git")
-    monkeypatch.setattr(GitRepository, "run", lambda self, *args, **kwargs: "/")
+    monkeypatch.setattr(GitRepository, "run", lambda self, *args, **kwargs: tmp_path.anchor)
     with pytest.raises(WeaverError) as root_error:
         GitRepository.open(str(tmp_path))
     assert root_error.value.code is ErrorCode.PATH_OUTSIDE_REPOSITORY
