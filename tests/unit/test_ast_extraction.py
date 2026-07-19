@@ -15,12 +15,22 @@ class Service:
         raise ValueError(value)
 """
     symbols = {item.qualified_name: item for item in extract_symbols(source)}
-    assert {"Service", "Service.fetch", "Service.fetch.normalize"} <= symbols.keys()
-    assert symbols["Service.fetch"].kind == "async_function"
+    assert {"<module>", "Service", "Service.fetch", "Service.fetch.normalize"} <= symbols.keys()
+    assert symbols["Service.fetch"].kind == "async_method"
+    assert symbols["Service.fetch.normalize"].kind == "function"
+    assert symbols["Service.fetch"].signature.endswith("-> dict[str, int]")
     assert symbols["Service.fetch"].default_map == {"value": "3"}
     assert symbols["Service.fetch"].decorators == ("classmethod",)
     assert symbols["Service.fetch"].features["comparisons"]
     assert symbols["Service.fetch"].features["raises"]
+
+
+def test_decorator_arguments_are_never_retained_as_context() -> None:
+    symbols = extract_symbols(
+        '@route("/private/path", token="must-not-leak")\ndef endpoint():\n    return 1\n'
+    )
+    endpoint = next(item for item in symbols if item.qualified_name == "endpoint")
+    assert endpoint.decorators == ("route",)
 
 
 def test_docstrings_and_formatting_do_not_change_fingerprint() -> None:

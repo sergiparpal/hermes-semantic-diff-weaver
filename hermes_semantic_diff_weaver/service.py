@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter, defaultdict
 from typing import Any
 from uuid import uuid4
@@ -104,25 +105,41 @@ def _read_readme_excerpt(repo: GitRepository, head_commit: str, config: WeaverCo
 
 def _deduplicate_candidates(candidates: list[SemanticCandidate]) -> list[SemanticCandidate]:
     output: list[SemanticCandidate] = []
-    by_key: dict[tuple[str, str, str, tuple[str, ...]], SemanticCandidate] = {}
+
+    def normalized(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
+
     for candidate in candidates:
-        key = (
-            candidate.path,
-            candidate.symbol,
-            candidate.category.value,
-            tuple(sorted(item.id for item in candidate.evidence)),
+        candidate_evidence = {item.id for item in candidate.evidence}
+        existing = next(
+            (
+                item
+                for item in output
+                if item.path == candidate.path
+                and item.symbol == candidate.symbol
+                and item.category is candidate.category
+                and (
+                    candidate_evidence & {evidence.id for evidence in item.evidence}
+                    or normalized(item.observable_impact) == normalized(candidate.observable_impact)
+                )
+            ),
+            None,
         )
-        if key not in by_key:
-            by_key[key] = candidate
+        if existing is None:
             output.append(candidate)
             continue
-        existing = by_key[key]
         if candidate.confidence_baseline > existing.confidence_baseline:
             existing.summary = candidate.summary
             existing.observable_impact = candidate.observable_impact
             existing.confidence_baseline = candidate.confidence_baseline
+        evidence_by_id = {item.id: item for item in existing.evidence}
+        for evidence in candidate.evidence:
+            evidence_by_id.setdefault(evidence.id, evidence)
+        existing.evidence = [evidence_by_id[key] for key in sorted(evidence_by_id)]
         existing.assumptions = sorted(set([*existing.assumptions, *candidate.assumptions]))
         existing.rule_ids = sorted(set([*existing.rule_ids, *candidate.rule_ids]))
+        existing.related_calls.update(candidate.related_calls)
+        existing.related_paths.update(candidate.related_paths)
         if candidate.origin is Origin.LLM_SUPPORTED:
             existing.origin = Origin.LLM_SUPPORTED
     return output
@@ -140,12 +157,6 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
     config, config_warnings = load_config(repo.root, request)
     collection = collect_diff(repo, base_commit, head_commit, config)
     ast_result = analyze_ast(collection.files)
-    if collection.files and not ast_result.deltas:
-        raise WeaverError(
-            ErrorCode.PARSE_FAILURE,
-            "No changed Python source could be parsed into meaningful structural evidence.",
-            "Fix syntax errors, narrow the scope, or analyze commits containing parseable Python.",
-        )
     omitted = [
         OmittedScope(reason=reason, count=count)
         for reason, count in sorted(collection.omitted_counts.items())
@@ -291,6 +302,10 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
     ]
     if not collection.files:
         limitations.append("The bounded diff contained no included changed Python source.")
+    elif not ast_result.deltas:
+        limitations.append(
+            "The included Python change contained no reportable behavior-bearing structural delta."
+        )
     if low_confidence_omitted:
         limitations.append(
             f"{low_confidence_omitted} low-confidence finding(s) were not presented as facts."

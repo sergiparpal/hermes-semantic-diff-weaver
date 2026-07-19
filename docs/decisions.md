@@ -35,9 +35,9 @@
 - Directory and pip entry-point discovery remain opt-in; project plugins require
   `HERMES_ENABLE_PROJECT_PLUGINS`.
 
-The CI compatibility job installs Hermes 0.14.0 and the built plugin wheel, then repeats both real
-discovery paths. The regular fake-context suite continues to validate registration without requiring
-Hermes or a live model.
+The CI compatibility matrix installs Hermes 0.14.0 and 0.18.2 with the built plugin wheel, then
+repeats both real discovery paths for each version. The regular fake-context suite continues to
+validate registration without requiring Hermes or a live model.
 
 ## Release note
 
@@ -48,3 +48,20 @@ The repository is licensed under MIT. Publishing or pushing remains a separately
 The retry-predicate fixture originally listed `state_transition_change` even though its increment
 statement was identical at both revisions. The expected label was removed after the required separate
 fixture review so evaluation does not reward an unsupported state-change finding.
+
+## Plan-conformance closure (2026-07-19)
+
+- Callable signatures now include return annotations and type comments; decorator evidence retains
+  safe names only.
+- Symbol inventory distinguishes methods and async methods, always records a module snapshot, and
+  preserves overload-style duplicate qualified names.
+- Matching now performs a conservative second pass across changed files, while ambiguous near-ties
+  remain separate findings with explicit warnings and reduced confidence.
+- Equivalent obligations merge by normalized Given/When/Then semantics, union behavior links and
+  candidate tests, preserve the strongest priority/confidence, and retain the global candidate cap.
+- LLM batching connects same-module evidence and cross-module changes sharing a changed dependency
+  call before applying input and call ceilings.
+- Candidate-test discovery now has aggregate file and byte safety caps, and the full deterministic
+  performance regression ceiling is five seconds as required by the implementation plan.
+- All 17 evaluation cases now have reviewed, normalized canonical JSON goldens in addition to their
+  machine-readable category/evidence/scenario labels.

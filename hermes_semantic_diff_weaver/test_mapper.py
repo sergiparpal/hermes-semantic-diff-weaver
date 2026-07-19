@@ -14,6 +14,8 @@ from .path_policy import exclusion_reason, glob_matches, redact_text
 from .semantic_candidates import SemanticCandidate
 
 TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+MAX_TEST_INDEX_FILES = 500
+MAX_TEST_INDEX_BYTES = 8 * 1024 * 1024
 CATEGORY_TERMS = {
     BehaviorCategory.BOUNDARY: {"boundary", "limit", "threshold"},
     BehaviorCategory.VALIDATION: {"valid", "invalid", "reject", "accept"},
@@ -59,6 +61,8 @@ class _ImportVisitor(ast.NodeVisitor):
         if node.module:
             self.imports.add(node.module)
             self.imports.update(f"{node.module}.{alias.name}" for alias in node.names)
+        elif node.level:
+            self.imports.update(alias.name for alias in node.names)
 
 
 def _is_test_path(path: str, roots: list[str]) -> bool:
@@ -111,14 +115,32 @@ def build_test_index(repo: GitRepository, head_commit: str, config: WeaverConfig
     tests: list[IndexedTest] = []
     incomplete = False
     warnings: list[str] = []
-    for path in repo.list_files(head_commit):
-        if exclusion_reason(path) or not _is_test_path(path, config.paths.test_roots):
-            continue
+    test_paths = sorted(
+        path
+        for path in repo.list_files(head_commit)
+        if not exclusion_reason(path) and _is_test_path(path, config.paths.test_roots)
+    )
+    if len(test_paths) > MAX_TEST_INDEX_FILES:
+        incomplete = True
+        warnings.append(
+            f"Candidate test indexing was capped at {MAX_TEST_INDEX_FILES} files; mapping is incomplete."
+        )
+        test_paths = test_paths[:MAX_TEST_INDEX_FILES]
+    indexed_bytes = 0
+    for path in test_paths:
         source = repo.read_blob(head_commit, path, config.rules.max_file_bytes)
         if source is None:
             incomplete = True
             warnings.append("At least one candidate test file was oversized, binary, or non-UTF-8.")
             continue
+        source_bytes = len(source.encode("utf-8"))
+        if indexed_bytes + source_bytes > MAX_TEST_INDEX_BYTES:
+            incomplete = True
+            warnings.append(
+                "Candidate test indexing reached its aggregate byte cap; mapping is incomplete."
+            )
+            break
+        indexed_bytes += source_bytes
         try:
             tests.extend(_index_source(path, source))
         except (SyntaxError, ValueError, TypeError):

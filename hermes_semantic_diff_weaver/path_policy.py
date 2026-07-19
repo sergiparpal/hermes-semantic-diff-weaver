@@ -22,7 +22,10 @@ CACHE_PARTS = {
     "node_modules",
 }
 SECRET_NAMES = {
+    ".authinfo",
+    ".authinfo.gpg",
     ".env",
+    ".git-credentials",
     ".netrc",
     ".npmrc",
     ".pypirc",
@@ -38,8 +41,23 @@ SECRET_NAMES = {
     "id_rsa",
     "secrets.yml",
     "secrets.yaml",
+    "service-account.json",
+    "service_account.json",
 }
-SECRET_SUFFIXES = {".jks", ".key", ".keystore", ".p12", ".pem", ".pfx"}
+SECRET_SUFFIXES = {
+    ".cer",
+    ".crt",
+    ".der",
+    ".jks",
+    ".key",
+    ".keystore",
+    ".p12",
+    ".p7b",
+    ".p7c",
+    ".pem",
+    ".pfx",
+}
+SECRET_DIRECTORY_PARTS = {".aws", ".azure", ".gnupg", ".ssh"}
 WINDOWS_RESERVED = {
     "CON",
     "PRN",
@@ -49,7 +67,10 @@ WINDOWS_RESERVED = {
     *(f"LPT{i}" for i in range(1, 10)),
 }
 REDACTIONS = (
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
+    re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:.*?-----END [A-Z ]*PRIVATE KEY-----|.*\Z)",
+        re.S,
+    ),
     re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,})\b"),
     re.compile(
         r"(?i)\b(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*['\"]?[^\s'\"]{8,}"
@@ -108,6 +129,12 @@ def exclusion_reason(path: str) -> str | None:
         return "control_directory"
     if any(part in CACHE_PARTS for part in parts):
         return "cache_or_environment"
+    if any(part in SECRET_DIRECTORY_PARTS for part in parts):
+        return "secret_filename"
+    if name == "config.json" and ".docker" in parts:
+        return "secret_filename"
+    if name == "config" and ".kube" in parts:
+        return "secret_filename"
     if name == ".env" or name.startswith(".env."):
         return "secret_filename"
     if name in SECRET_NAMES or suffix in SECRET_SUFFIXES:
@@ -144,7 +171,7 @@ def is_included(path: str, includes: list[str], excludes: list[str]) -> bool:
 
 def redact_text(text: str, *, max_chars: int = 2000) -> str:
     """Bound and redact obvious credentials before evidence leaves preprocessing."""
-    bounded = text[:max_chars]
+    redacted = text
     for pattern in REDACTIONS:
-        bounded = pattern.sub("[REDACTED]", bounded)
-    return bounded
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted[:max_chars]

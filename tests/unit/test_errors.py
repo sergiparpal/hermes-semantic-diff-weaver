@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import hermes_semantic_diff_weaver.service as service
 from hermes_semantic_diff_weaver.errors import ErrorCode, WeaverError, internal_error
 from hermes_semantic_diff_weaver.plugin import handle_analyze_semantic_diff
@@ -31,6 +33,24 @@ def test_safe_error_shape() -> None:
         "remediation": "Use a commit.",
     }
     assert "unexpected" in internal_error().safe_message
+
+
+@pytest.mark.parametrize("code", list(ErrorCode))
+def test_handler_preserves_every_typed_public_error(code: ErrorCode, monkeypatch) -> None:
+    monkeypatch.setattr(
+        service,
+        "analyze",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            WeaverError(code, "Safe bounded failure.", "Retry safely.")
+        ),
+    )
+    result = json.loads(handle_analyze_semantic_diff({"repo_path": ".", "base_ref": "HEAD"}))
+    assert result == {
+        "success": False,
+        "error": code.value,
+        "message": "Safe bounded failure.",
+        "remediation": "Retry safely.",
+    }
 
 
 def test_handler_rejects_invalid_arguments_as_json() -> None:

@@ -36,6 +36,8 @@ class SemanticCandidate:
     assumptions: list[str] = field(default_factory=list)
     origin: Origin = Origin.DETERMINISTIC
     rule_ids: list[str] = field(default_factory=list)
+    related_calls: set[str] = field(default_factory=set)
+    related_paths: set[str] = field(default_factory=set)
 
     @property
     def path(self) -> str:
@@ -63,6 +65,22 @@ def _classification(
             0.68,
             ["Only bounded Git hunk metadata is available because static parsing failed."],
             "SDW-RULE-PARSE-INCOMPLETE",
+        )
+    if delta.kind in {"symbol_added", "symbol_removed"}:
+        ambiguous = bool(delta.metadata.get("ambiguous_match"))
+        direction = "added" if delta.kind == "symbol_added" else "removed"
+        assumptions = ["The runtime and caller contract is unavailable to static analysis."]
+        if ambiguous:
+            assumptions.append(
+                "Multiple near-equal symbol matches prevented a reliable rename or move correlation."
+            )
+        return (
+            BehaviorCategory.UNKNOWN,
+            f"A callable or structural symbol was {direction} without a reliable semantic match.",
+            "Callers or observable behavior may change; the intended compatibility contract needs review.",
+            0.42 if ambiguous else 0.58,
+            assumptions,
+            "SDW-RULE-AMBIGUOUS-SYMBOL" if ambiguous else "SDW-RULE-SYMBOL-LIFECYCLE",
         )
     if delta.kind == "comparison_change":
         if _contains(combined, RETRY_TERMS):
@@ -303,12 +321,26 @@ def build_candidates(
             parser_complete=delta.parser_complete,
         )
         key = (delta.path, delta.symbol, category)
+        related_calls = {
+            call
+            for field_name in ("old_calls", "new_calls")
+            for call in delta.metadata.get(field_name, [])
+            if isinstance(call, str) and call != "<dynamic>"
+        }
+        related_paths = {
+            path
+            for field_name in ("old_path", "new_path")
+            if isinstance((path := delta.metadata.get(field_name)), str)
+        }
+        related_paths.add(delta.path)
         if key in grouped:
             current = grouped[key]
             current.evidence.append(evidence)
             current.confidence_baseline = max(current.confidence_baseline, baseline)
             current.assumptions = sorted(set([*current.assumptions, *assumptions]))
             current.rule_ids.append(rule_id)
+            current.related_calls.update(related_calls)
+            current.related_paths.update(related_paths)
         else:
             grouped[key] = SemanticCandidate(
                 category=category,
@@ -318,5 +350,7 @@ def build_candidates(
                 confidence_baseline=baseline,
                 assumptions=assumptions,
                 rule_ids=[rule_id],
+                related_calls=related_calls,
+                related_paths=related_paths,
             )
     return sorted(grouped.values(), key=lambda item: (item.path, item.symbol, item.category.value))

@@ -7,7 +7,12 @@ import pytest
 
 from hermes_semantic_diff_weaver.ast_diff import StructuralDelta
 from hermes_semantic_diff_weaver.errors import ErrorCode, WeaverError
-from hermes_semantic_diff_weaver.models import CriticalPath, LineRange, WeaverConfig
+from hermes_semantic_diff_weaver.models import (
+    CriticalPath,
+    LineRange,
+    LlmBatchResponse,
+    WeaverConfig,
+)
 from hermes_semantic_diff_weaver.semantic_candidates import build_candidates
 from hermes_semantic_diff_weaver.semantic_interpreter import interpret_candidates
 
@@ -27,6 +32,16 @@ class FakeLlm:
     def complete_structured(self, **kwargs: Any) -> Result:
         self.calls.append(kwargs)
         return self.results[min(len(self.calls) - 1, len(self.results) - 1)]
+
+
+class RaisingLlm:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.calls = 0
+
+    def complete_structured(self, **kwargs: Any) -> Result:
+        self.calls += 1
+        raise self.error
 
 
 def candidate():
@@ -93,6 +108,23 @@ def test_call_shape_uses_active_host_model_without_overrides() -> None:
     assert result.suggestions
 
 
+def test_pydantic_parsed_results_and_common_usage_aliases_are_accepted() -> None:
+    llm = FakeLlm(
+        [
+            Result(
+                "json",
+                LlmBatchResponse.model_validate(valid_payload()),
+                usage={"prompt_tokens": 7, "completion_tokens": 3, "cost": 0.002},
+            )
+        ]
+    )
+    result = interpret_candidates([candidate()], llm, WeaverConfig())
+    assert result.status.available is True
+    assert result.status.usage.input_tokens == 7
+    assert result.status.usage.output_tokens == 3
+    assert result.status.usage.cost == 0.002
+
+
 def test_text_result_retries_once_then_falls_back() -> None:
     llm = FakeLlm([Result("text", None)])
     result = interpret_candidates([candidate()], llm, WeaverConfig())
@@ -101,6 +133,25 @@ def test_text_result_retries_once_then_falls_back() -> None:
     assert result.status.failures == 1
     assert result.candidates
     assert result.warnings
+
+
+def test_empty_structured_result_retries_once_then_falls_back() -> None:
+    llm = FakeLlm([Result("json", None)])
+    result = interpret_candidates([candidate()], llm, WeaverConfig())
+    assert len(llm.calls) == 2
+    assert result.status.available is False
+
+
+def test_timeout_retries_but_unexpected_provider_failure_does_not() -> None:
+    timeout = RaisingLlm(TimeoutError("retryable"))
+    timeout_result = interpret_candidates([candidate()], timeout, WeaverConfig())
+    assert timeout.calls == 2
+    assert timeout_result.status.failures == 1
+
+    provider = RaisingLlm(RuntimeError("provider unavailable"))
+    provider_result = interpret_candidates([candidate()], provider, WeaverConfig())
+    assert provider.calls == 1
+    assert provider_result.status.failures == 1
 
 
 def test_call_count_never_exceeds_eight() -> None:
@@ -138,6 +189,21 @@ def test_schema_failure_retries_once_and_can_recover() -> None:
     assert result.status.calls == 2
 
 
+def test_excessive_assumptions_and_oversized_output_fail_closed() -> None:
+    assumptions = valid_payload()
+    assumptions["behaviors"][0]["assumptions"] = [f"assumption-{index}" for index in range(11)]
+    assumption_result = interpret_candidates(
+        [candidate()], FakeLlm([Result("json", assumptions)]), WeaverConfig()
+    )
+    assert assumption_result.status.available is False
+
+    oversized = {"behaviors": [], "obligations": [], "ignored": "x" * 200_001}
+    oversized_result = interpret_candidates(
+        [candidate()], FakeLlm([Result("json", oversized)]), WeaverConfig()
+    )
+    assert oversized_result.status.available is False
+
+
 def test_readme_context_is_bounded_redacted_and_untrusted() -> None:
     config = WeaverConfig()
     config.rules.max_readme_chars = 200
@@ -168,6 +234,36 @@ def test_critical_path_batches_are_prioritized_under_call_cap() -> None:
     result = interpret_candidates([ordinary, critical], llm, config)
     assert "src/critical.py" in llm.calls[0]["input"][0]["text"]
     assert result.omitted_batches == 1
+
+
+def test_cross_module_changes_to_a_shared_call_are_batched_together() -> None:
+    candidates = build_candidates(
+        [
+            StructuralDelta(
+                path=path,
+                symbol=symbol,
+                kind="call_change",
+                old=f"client.fetch({old_argument})",
+                new=f"client.fetch({new_argument})",
+                old_lines=LineRange(start=2, end=2),
+                new_lines=LineRange(start=2, end=2),
+                hunk_id=f"{path}#hunk-001",
+                metadata={
+                    "old_calls": ["client.fetch"],
+                    "new_calls": ["client.fetch"],
+                },
+            )
+            for path, symbol, old_argument, new_argument in (
+                ("src/first.py", "first", "x", "x, strict=True"),
+                ("src/second.py", "second", "y", "y, strict=True"),
+            )
+        ]
+    )
+    llm = FakeLlm([Result("json", {"behaviors": [], "obligations": []})])
+    result = interpret_candidates(candidates, llm, WeaverConfig())
+    assert result.status.calls == 1
+    assert "src/first.py" in llm.calls[0]["input"][0]["text"]
+    assert "src/second.py" in llm.calls[0]["input"][0]["text"]
 
 
 def test_disabled_fallback_uses_specific_public_llm_errors() -> None:

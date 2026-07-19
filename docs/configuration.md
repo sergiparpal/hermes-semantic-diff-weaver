@@ -54,3 +54,7 @@ Configured excludes are additive with mandatory control, credential, key, token,
 and cloud-configuration exclusions. If a file/line budget is exceeded, configured critical paths are
 prioritized only when this can be done within the same hard bounds; all remaining scope is reported as
 omitted.
+
+Candidate-test indexing also has non-configurable safety ceilings of 500 test files and 8 MiB of
+aggregate UTF-8 test source. These ceilings cannot be expanded by repository configuration. Reaching
+either one emits a warning and uses `mapping_incomplete` when no candidate is found.

@@ -41,6 +41,12 @@ def test_paths_normalize_and_globs_match_root() -> None:
         (".git/config", "control_directory"),
         ("config/access_token.json", "secret_filename"),
         ("config/passwords.toml", "secret_filename"),
+        (".git-credentials", "secret_filename"),
+        (".docker/config.json", "secret_filename"),
+        (".kube/config", "secret_filename"),
+        (".ssh/config", "secret_filename"),
+        ("certs/client.crt", "secret_filename"),
+        ("cloud/service-account.json", "secret_filename"),
     ],
 )
 def test_mandatory_exclusions(path: str, reason: str) -> None:
@@ -51,6 +57,15 @@ def test_inline_secrets_are_redacted_and_bounded() -> None:
     source = "api_key = 'abcdefghijklmnopqrstuvwxyz123456'\nsk-abcdefghijklmnopqrstuvwxyz"
     redacted = redact_text(source, max_chars=100)
     assert "abcdefghijklmnopqrstuvwxyz" not in redacted
+    assert "[REDACTED]" in redacted
+    assert len(redact_text("x" * 100, max_chars=12)) == 12
+
+
+def test_incomplete_private_key_is_redacted_before_truncation() -> None:
+    text = "prefix -----BEGIN PRIVATE KEY-----\nsecret-material-without-end-marker"
+    redacted = redact_text(text, max_chars=50)
+    assert "secret-material" not in redacted
+    assert "PRIVATE KEY" not in redacted
     assert "[REDACTED]" in redacted
 
 

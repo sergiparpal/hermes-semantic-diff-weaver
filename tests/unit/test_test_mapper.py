@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import hermes_semantic_diff_weaver.test_mapper as test_mapper
 from hermes_semantic_diff_weaver.ast_diff import StructuralDelta
 from hermes_semantic_diff_weaver.models import LineRange, WeaverConfig
 from hermes_semantic_diff_weaver.semantic_candidates import build_candidates
-from hermes_semantic_diff_weaver.test_mapper import IndexedTest, TestIndex, map_candidate_tests
+from hermes_semantic_diff_weaver.test_mapper import (
+    IndexedTest,
+    TestIndex,
+    build_test_index,
+    map_candidate_tests,
+)
 
 
 def boundary_candidate():
@@ -59,3 +65,25 @@ def test_structural_features_rank_and_cap_stably() -> None:
     assert len(mapped) == 5
     assert all(item.verified is False for item in mapped)
     assert mapped == sorted(mapped, key=lambda item: (-item.match_score, item.path, item.symbol))
+
+
+def test_test_index_has_aggregate_file_and_byte_caps(monkeypatch) -> None:
+    class FakeRepository:
+        def list_files(self, commit: str) -> list[str]:
+            return ["tests/test_a.py", "tests/test_b.py"]
+
+        def read_blob(self, commit: str, path: str, max_bytes: int) -> str:
+            return "def test_value():\n    assert True\n"
+
+    monkeypatch.setattr(test_mapper, "MAX_TEST_INDEX_FILES", 1)
+    index = build_test_index(FakeRepository(), "a" * 40, WeaverConfig())
+    assert index.incomplete is True
+    assert len(index.tests) == 1
+    assert any("capped" in warning for warning in index.warnings)
+
+    monkeypatch.setattr(test_mapper, "MAX_TEST_INDEX_FILES", 500)
+    monkeypatch.setattr(test_mapper, "MAX_TEST_INDEX_BYTES", 1)
+    byte_limited = build_test_index(FakeRepository(), "a" * 40, WeaverConfig())
+    assert byte_limited.incomplete is True
+    assert byte_limited.tests == []
+    assert any("byte cap" in warning for warning in byte_limited.warnings)

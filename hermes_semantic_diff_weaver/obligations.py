@@ -12,6 +12,7 @@ from .models import (
     CandidateTest,
     CoverageStatus,
     ObligationType,
+    Origin,
     Presentation,
     TestObligation,
     WeaverConfig,
@@ -30,6 +31,7 @@ class Scenario:
     when: str
     then: str
     relevance: int = 95
+    origin: Origin | None = None
 
 
 TEMPLATES: dict[BehaviorCategory, tuple[Scenario, ...]] = {
@@ -278,6 +280,31 @@ def _normal(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
 
 
+def _merge_candidate_tests(
+    current: list[CandidateTest], incoming: list[CandidateTest]
+) -> list[CandidateTest]:
+    merged: dict[tuple[str, str], CandidateTest] = {
+        (item.path, item.symbol): item.model_copy(deep=True) for item in current
+    }
+    for item in incoming:
+        key = (item.path, item.symbol)
+        if key not in merged:
+            merged[key] = item.model_copy(deep=True)
+            continue
+        existing = merged[key]
+        existing.match_score = max(existing.match_score, item.match_score)
+        existing.match_reasons = sorted(set([*existing.match_reasons, *item.match_reasons]))
+    return sorted(merged.values(), key=lambda item: (-item.match_score, item.path, item.symbol))
+
+
+def _coverage_status(candidates: list[CandidateTest], mapping_incomplete: bool) -> CoverageStatus:
+    if candidates:
+        return CoverageStatus.CANDIDATE_UNVERIFIED
+    if mapping_incomplete:
+        return CoverageStatus.INCOMPLETE
+    return CoverageStatus.NONE_FOUND
+
+
 def generate_obligations(
     behaviors: list[BehaviorChange],
     candidate_tests: dict[str, list[CandidateTest]],
@@ -286,18 +313,11 @@ def generate_obligations(
     llm_suggestions: list[SuggestedScenario] | None = None,
 ) -> tuple[list[TestObligation], int]:
     generated: list[TestObligation] = []
-    seen: set[tuple[str, str, str, str]] = set()
+    by_semantics: dict[tuple[str, str, str], TestObligation] = {}
     for behavior in behaviors:
         candidates = candidate_tests.get(behavior.id, [])
-        if candidates:
-            coverage = CoverageStatus.CANDIDATE_UNVERIFIED
-            gap = 60
-        elif mapping_incomplete:
-            coverage = CoverageStatus.INCOMPLETE
-            gap = 90
-        else:
-            coverage = CoverageStatus.NONE_FOUND
-            gap = 90
+        coverage = _coverage_status(candidates, mapping_incomplete)
+        gap = 60 if candidates else 90
         scenarios: tuple[Scenario, ...] = TEMPLATES[behavior.category]
         behavior_evidence_ids = {item.id for item in behavior.evidence}
         supported_suggestions = [
@@ -308,6 +328,7 @@ def generate_obligations(
                 item.when,
                 item.then,
                 85,
+                Origin.LLM_SUPPORTED,
             )
             for item in (llm_suggestions or [])
             if set(item.evidence_ids) <= behavior_evidence_ids
@@ -329,33 +350,51 @@ def generate_obligations(
             )
         for scenario in scenarios:
             key = (
-                behavior.id,
                 _normal(scenario.given),
                 _normal(scenario.when),
                 _normal(scenario.then),
             )
-            if key in seen:
-                continue
-            seen.add(key)
             priority = obligation_priority(
                 behavior.risk_score, scenario.relevance, gap, behavior.confidence
             )
-            generated.append(
-                TestObligation(
-                    id=f"to-{len(generated) + 1:03d}",
-                    behavior_change_ids=[behavior.id],
-                    type=scenario.type,
-                    priority=priority,
-                    title=scenario.title,
-                    given=scenario.given,
-                    when=scenario.when,
-                    then=scenario.then,
-                    candidate_existing_tests=candidates,
-                    coverage_status=coverage,
-                    origin=behavior.origin,
-                    confidence=behavior.confidence,
+            scenario_origin = scenario.origin or behavior.origin
+            if key in by_semantics:
+                existing = by_semantics[key]
+                existing.behavior_change_ids = sorted(
+                    set([*existing.behavior_change_ids, behavior.id])
                 )
+                existing.priority = max(existing.priority, priority)
+                existing.candidate_existing_tests = _merge_candidate_tests(
+                    existing.candidate_existing_tests, candidates
+                )[: config.rules.max_candidate_tests_per_obligation]
+                existing.coverage_status = _coverage_status(
+                    existing.candidate_existing_tests, mapping_incomplete
+                )
+                if behavior.confidence > existing.confidence:
+                    existing.type = scenario.type
+                    existing.title = scenario.title
+                    existing.given = scenario.given
+                    existing.when = scenario.when
+                    existing.then = scenario.then
+                    existing.origin = scenario_origin
+                existing.confidence = max(existing.confidence, behavior.confidence)
+                continue
+            obligation = TestObligation(
+                id=f"to-{len(generated) + 1:03d}",
+                behavior_change_ids=[behavior.id],
+                type=scenario.type,
+                priority=priority,
+                title=scenario.title,
+                given=scenario.given,
+                when=scenario.when,
+                then=scenario.then,
+                candidate_existing_tests=candidates,
+                coverage_status=coverage,
+                origin=scenario_origin,
+                confidence=behavior.confidence,
             )
+            generated.append(obligation)
+            by_semantics[key] = obligation
     ordered = sorted(
         generated, key=lambda item: (-item.priority, item.behavior_change_ids[0], item.title)
     )

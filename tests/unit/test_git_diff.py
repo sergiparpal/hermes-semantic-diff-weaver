@@ -193,6 +193,14 @@ def test_malformed_and_truncated_numstat_records_are_ignored() -> None:
     assert _parse_numstat(b"1\t1\t\x00") == ({}, 0)
 
 
+def test_copy_name_status_preserves_both_nul_delimited_paths() -> None:
+    copied = _parse_name_status(b"C100\x00src/original.py\x00src/copied.py\x00")
+    assert len(copied) == 1
+    assert copied[0].status == "C100"
+    assert copied[0].old_path == "src/original.py"
+    assert copied[0].new_path == "src/copied.py"
+
+
 def test_nul_delimited_metadata_preserves_newline_filename() -> None:
     path = "src/line\nbreak.py"
     changed = _parse_name_status(b"M\x00" + path.encode("utf-8") + b"\x00")

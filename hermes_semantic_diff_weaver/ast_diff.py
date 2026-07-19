@@ -33,6 +33,22 @@ def _call_name(node: ast.AST) -> str:
     return "<dynamic>"
 
 
+def _decorator_name(node: ast.AST) -> str:
+    """Return only a bounded decorator name, never its untrusted arguments."""
+    target = node.func if isinstance(node, ast.Call) else node
+    return redact_text(_call_name(target), max_chars=120)
+
+
+def _function_signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    """Normalize the complete callable signature, including its return annotation."""
+    signature = f"({_compact(node.args, 900)})"
+    if node.returns is not None:
+        signature += f" -> {_compact(node.returns, 300)}"
+    if node.type_comment:
+        signature += f" # type: {redact_text(node.type_comment, max_chars=300)}"
+    return signature
+
+
 def _body_fingerprint(body: list[ast.stmt]) -> str:
     material = _behavior_body(body)
     dump = ast.dump(ast.Module(body=material, type_ignores=[]), include_attributes=False)
@@ -186,6 +202,7 @@ class SymbolSnapshot:
     features: dict[str, tuple[tuple[str, int], ...]]
     statement_order: tuple[str, ...]
     node_inventory: tuple[tuple[str, int], ...]
+    match_ambiguous: bool = False
 
     @property
     def signature_shape(self) -> str:
@@ -226,13 +243,13 @@ def _snapshot(node: ast.AST, qualified_name: str, kind: str) -> SymbolSnapshot:
     visitor = FeatureVisitor(node)
     visitor.visit(node)
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        signature = _compact(node.args, 1000)
+        signature = _function_signature(node)
         defaults = _defaults(node)
-        decorators = tuple(_compact(item, 120) for item in node.decorator_list)
+        decorators = tuple(_decorator_name(item) for item in node.decorator_list)
     elif isinstance(node, ast.ClassDef):
         signature = f"bases({', '.join(_compact(item, 120) for item in node.bases)})"
         defaults = {}
-        decorators = tuple(_compact(item, 120) for item in node.decorator_list)
+        decorators = tuple(_decorator_name(item) for item in node.decorator_list)
     else:
         signature = "module"
         defaults = {}
@@ -267,7 +284,7 @@ def extract_symbols(source: str) -> list[SymbolSnapshot]:
     tree = ast.parse(source, type_comments=True)
     symbols: list[SymbolSnapshot] = []
 
-    def walk(body: list[ast.stmt], prefix: str) -> None:
+    def walk(body: list[ast.stmt], prefix: str, *, parent_is_class: bool = False) -> None:
         module_body: list[ast.stmt] = []
         for statement in body:
             if isinstance(statement, ast.ClassDef):
@@ -288,12 +305,19 @@ def extract_symbols(source: str) -> list[SymbolSnapshot]:
                 ast.copy_location(class_shell, statement)
                 class_shell.end_lineno = statement.end_lineno
                 symbols.append(_snapshot(class_shell, name, "class"))
-                walk(statement.body, name)
+                walk(statement.body, name, parent_is_class=True)
             elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 name = f"{prefix}.{statement.name}" if prefix else statement.name
-                kind = (
-                    "async_function" if isinstance(statement, ast.AsyncFunctionDef) else "function"
-                )
+                if parent_is_class:
+                    kind = (
+                        "async_method" if isinstance(statement, ast.AsyncFunctionDef) else "method"
+                    )
+                else:
+                    kind = (
+                        "async_function"
+                        if isinstance(statement, ast.AsyncFunctionDef)
+                        else "function"
+                    )
                 symbols.append(_snapshot(statement, name, kind))
                 nested = [
                     item
@@ -303,9 +327,12 @@ def extract_symbols(source: str) -> list[SymbolSnapshot]:
                 walk(nested, name)
             else:
                 module_body.append(statement)
-        if not prefix and module_body:
+        if not prefix:
             module = ast.Module(body=module_body, type_ignores=[])
-            symbols.append(_snapshot(module, "<module>", "module"))
+            snapshot = _snapshot(module, "<module>", "module")
+            snapshot.start = 1
+            snapshot.end = max(1, len(source.splitlines()))
+            symbols.append(snapshot)
 
     walk(tree.body, "")
     return symbols
@@ -341,13 +368,20 @@ def _overlaps(start: int, end: int, hunk_start: int, hunk_count: int) -> bool:
 
 
 def _matching_hunk(
-    old: SymbolSnapshot | None, new: SymbolSnapshot | None, hunks: list[Hunk], path: str
+    old: SymbolSnapshot | None,
+    new: SymbolSnapshot | None,
+    *,
+    old_hunks: list[Hunk],
+    new_hunks: list[Hunk],
+    old_path: str,
+    new_path: str,
 ) -> str | None:
-    for hunk in hunks:
-        if old and _overlaps(old.start, old.end, hunk.old_start, hunk.old_count):
-            return f"{path}#{hunk.id}"
+    for hunk in new_hunks:
         if new and _overlaps(new.start, new.end, hunk.new_start, hunk.new_count):
-            return f"{path}#{hunk.id}"
+            return f"{new_path}#{hunk.id}"
+    for hunk in old_hunks:
+        if old and _overlaps(old.start, old.end, hunk.old_start, hunk.old_count):
+            return f"{old_path}#{hunk.id}"
     return None
 
 
@@ -393,14 +427,50 @@ def _compare_symbol(
     old: SymbolSnapshot | None,
     new: SymbolSnapshot | None,
     hunks: list[Hunk],
+    *,
+    old_path: str | None = None,
+    new_path: str | None = None,
+    old_hunks: list[Hunk] | None = None,
+    new_hunks: list[Hunk] | None = None,
 ) -> list[StructuralDelta]:
-    hunk_id = _matching_hunk(old, new, hunks, path)
-    if hunk_id is None and old and new:
+    effective_old_path = old_path or path
+    effective_new_path = new_path or path
+    hunk_id = _matching_hunk(
+        old,
+        new,
+        old_hunks=old_hunks if old_hunks is not None else hunks,
+        new_hunks=new_hunks if new_hunks is not None else hunks,
+        old_path=effective_old_path,
+        new_path=effective_new_path,
+    )
+    if hunk_id is None:
         return []
     if old is None:
-        return [_delta(path, old, new, hunk_id, "symbol_added", None, new.signature)]
+        return [
+            _delta(
+                path,
+                old,
+                new,
+                hunk_id,
+                "symbol_added",
+                None,
+                new.signature,
+                ambiguous_match=new.match_ambiguous,
+            )
+        ]
     if new is None:
-        return [_delta(path, old, new, hunk_id, "symbol_removed", old.signature, None)]
+        return [
+            _delta(
+                path,
+                old,
+                new,
+                hunk_id,
+                "symbol_removed",
+                old.signature,
+                None,
+                ambiguous_match=old.match_ambiguous,
+            )
+        ]
     result: list[StructuralDelta] = []
     if old.signature != new.signature:
         result.append(
@@ -465,7 +535,17 @@ def _compare_symbol(
     if old_names != new_names:
         kind = "call_order_change" if sorted(old_names) == sorted(new_names) else "call_change"
         result.append(
-            _delta(path, old, new, hunk_id, kind, "; ".join(old_names), "; ".join(new_names))
+            _delta(
+                path,
+                old,
+                new,
+                hunk_id,
+                kind,
+                "; ".join(old_names),
+                "; ".join(new_names),
+                old_calls=[item.split("(", 1)[0] for item in old_names],
+                new_calls=[item.split("(", 1)[0] for item in new_names],
+            )
         )
     result_kinds = {item.kind for item in result}
     if "raise_change" in result_kinds and "call_change" in result_kinds:
@@ -525,6 +605,9 @@ def _compare_symbol(
         result.append(
             _delta(path, old, new, hunk_id, "unknown_structure", "body changed", "body changed")
         )
+    if effective_old_path != effective_new_path:
+        for item in result:
+            item.metadata.update(old_path=effective_old_path, new_path=effective_new_path)
     return result
 
 
@@ -578,23 +661,55 @@ def _symbol_similarity(old: SymbolSnapshot, new: SymbolSnapshot) -> float:
 def _match_symbols(
     old_symbols: list[SymbolSnapshot], new_symbols: list[SymbolSnapshot]
 ) -> tuple[list[tuple[SymbolSnapshot | None, SymbolSnapshot | None]], list[str]]:
+    """Match symbols within one file while preserving overload-style duplicate names."""
     pairs: list[tuple[SymbolSnapshot | None, SymbolSnapshot | None]] = []
     warnings: list[str] = []
-    old_by_name = {item.qualified_name: item for item in old_symbols}
-    new_by_name = {item.qualified_name: item for item in new_symbols}
-    matched_old: set[str] = set()
-    matched_new: set[str] = set()
+    old_by_name: dict[str, list[SymbolSnapshot]] = defaultdict(list)
+    new_by_name: dict[str, list[SymbolSnapshot]] = defaultdict(list)
+    for item in old_symbols:
+        old_by_name[item.qualified_name].append(item)
+    for item in new_symbols:
+        new_by_name[item.qualified_name].append(item)
+    matched_old: set[int] = set()
+    matched_new: set[int] = set()
     for name in sorted(old_by_name.keys() & new_by_name.keys()):
-        pairs.append((old_by_name[name], new_by_name[name]))
-        matched_old.add(name)
-        matched_new.add(name)
+        old_group = sorted(old_by_name[name], key=lambda item: item.start)
+        new_group = sorted(new_by_name[name], key=lambda item: item.start)
+        # Exact definition shapes preserve overloads even when their order changes.
+        for old in old_group:
+            possible = [
+                new
+                for new in new_group
+                if id(new) not in matched_new
+                and old.kind == new.kind
+                and old.signature == new.signature
+                and old.fingerprint == new.fingerprint
+            ]
+            if len(possible) == 1:
+                new = possible[0]
+                pairs.append((old, new))
+                matched_old.add(id(old))
+                matched_new.add(id(new))
+        remaining_old_same = [item for item in old_group if id(item) not in matched_old]
+        remaining_new_same = [item for item in new_group if id(item) not in matched_new]
+        # Exact qualified names are the authoritative next pass. Source order disambiguates
+        # overload-like duplicates without discarding either definition.
+        for old, new in zip(remaining_old_same, remaining_new_same, strict=False):
+            pairs.append((old, new))
+            matched_old.add(id(old))
+            matched_new.add(id(new))
+        if len(old_group) != len(new_group) and max(len(old_group), len(new_group)) > 1:
+            warnings.append(
+                f"Overload-like definition count changed for {name!r}; unmatched definitions "
+                "were retained explicitly."
+            )
     remaining_old = sorted(
-        (item for item in old_symbols if item.qualified_name not in matched_old),
-        key=lambda item: item.qualified_name,
+        (item for item in old_symbols if id(item) not in matched_old),
+        key=lambda item: (item.qualified_name, item.start),
     )
     remaining_new = sorted(
-        (item for item in new_symbols if item.qualified_name not in matched_new),
-        key=lambda item: item.qualified_name,
+        (item for item in new_symbols if id(item) not in matched_new),
+        key=lambda item: (item.qualified_name, item.start),
     )
     candidates: dict[str, list[SymbolSnapshot]] = defaultdict(list)
     for item in remaining_new:
@@ -602,18 +717,19 @@ def _match_symbols(
     unresolved: list[SymbolSnapshot] = []
     for old in remaining_old:
         key = f"{old.kind}:{old.signature_shape}:{old.fingerprint}"
-        possible = [
-            item for item in candidates.get(key, []) if item.qualified_name not in matched_new
-        ]
+        possible = [item for item in candidates.get(key, []) if id(item) not in matched_new]
         if len(possible) == 1:
             new = possible[0]
             pairs.append((old, new))
-            matched_new.add(new.qualified_name)
+            matched_old.add(id(old))
+            matched_new.add(id(new))
         elif len(possible) > 1:
+            old.match_ambiguous = True
+            for item in possible:
+                item.match_ambiguous = True
             warnings.append(
                 f"Ambiguous symbol match for {old.qualified_name!r}; treated conservatively."
             )
-            pairs.append((old, None))
         else:
             unresolved.append(old)
     for old in unresolved:
@@ -621,27 +737,130 @@ def _match_symbols(
             (
                 (_symbol_similarity(old, new), new)
                 for new in remaining_new
-                if new.qualified_name not in matched_new
+                if id(new) not in matched_new
             ),
-            key=lambda item: (-item[0], item[1].qualified_name),
+            key=lambda item: (-item[0], item[1].qualified_name, item[1].start),
         )
         plausible = [item for item in scored if item[0] >= 0.82]
         if not plausible:
-            pairs.append((old, None))
             continue
         if len(plausible) > 1 and plausible[0][0] - plausible[1][0] <= 0.03:
+            old.match_ambiguous = True
+            for _, item in plausible:
+                item.match_ambiguous = True
             warnings.append(
                 f"Ambiguous similarity match for {old.qualified_name!r}; treated conservatively."
             )
-            pairs.append((old, None))
             continue
         new = plausible[0][1]
         pairs.append((old, new))
-        matched_new.add(new.qualified_name)
+        matched_old.add(id(old))
+        matched_new.add(id(new))
+    for old in remaining_old:
+        if id(old) not in matched_old:
+            pairs.append((old, None))
     for new in remaining_new:
-        if new.qualified_name not in matched_new:
+        if id(new) not in matched_new:
             pairs.append((None, new))
     return pairs, warnings
+
+
+def _match_cross_file_symbols(
+    removed: list[tuple[SymbolSnapshot, ChangedFile]],
+    added: list[tuple[SymbolSnapshot, ChangedFile]],
+) -> tuple[
+    list[tuple[SymbolSnapshot, ChangedFile, SymbolSnapshot, ChangedFile]],
+    list[tuple[SymbolSnapshot, ChangedFile]],
+    list[tuple[SymbolSnapshot, ChangedFile]],
+    list[str],
+]:
+    """Correlate conservative symbol moves between distinct changed files."""
+    pairs: list[tuple[SymbolSnapshot, ChangedFile, SymbolSnapshot, ChangedFile]] = []
+    warnings: list[str] = []
+    matched_old: set[int] = set()
+    matched_new: set[int] = set()
+
+    def available_added() -> list[tuple[SymbolSnapshot, ChangedFile]]:
+        return [item for item in added if id(item[0]) not in matched_new]
+
+    # Preserve exact qualified names across files first, but never force duplicate near-ties.
+    for old, old_file in removed:
+        if old.kind == "module":
+            continue
+        exact = [
+            (new, new_file)
+            for new, new_file in available_added()
+            if new.kind == old.kind and new.qualified_name == old.qualified_name
+        ]
+        if len(exact) == 1:
+            new, new_file = exact[0]
+            pairs.append((old, old_file, new, new_file))
+            matched_old.add(id(old))
+            matched_new.add(id(new))
+        elif len(exact) > 1:
+            old.match_ambiguous = True
+            for new, _ in exact:
+                new.match_ambiguous = True
+            warnings.append(
+                f"Ambiguous cross-file move for {old.qualified_name!r}; treated conservatively."
+            )
+
+    # An exact signature and behavior fingerprint is strong move evidence even after a rename.
+    for old, old_file in removed:
+        if id(old) in matched_old or old.kind == "module":
+            continue
+        exact = [
+            (new, new_file)
+            for new, new_file in available_added()
+            if new.kind == old.kind
+            and new.signature_shape == old.signature_shape
+            and new.fingerprint == old.fingerprint
+        ]
+        if len(exact) == 1:
+            new, new_file = exact[0]
+            pairs.append((old, old_file, new, new_file))
+            matched_old.add(id(old))
+            matched_new.add(id(new))
+        elif len(exact) > 1:
+            old.match_ambiguous = True
+            for new, _ in exact:
+                new.match_ambiguous = True
+            warnings.append(
+                f"Ambiguous cross-file fingerprint match for {old.qualified_name!r}; "
+                "treated conservatively."
+            )
+
+    for old, old_file in removed:
+        if id(old) in matched_old or old.kind == "module":
+            continue
+        scored = sorted(
+            (
+                (_symbol_similarity(old, new), new, new_file)
+                for new, new_file in available_added()
+                if new.kind != "module"
+            ),
+            key=lambda item: (-item[0], item[2].path, item[1].qualified_name, item[1].start),
+        )
+        plausible = [item for item in scored if item[0] >= 0.82]
+        if not plausible:
+            continue
+        if len(plausible) > 1 and plausible[0][0] - plausible[1][0] <= 0.03:
+            old.match_ambiguous = True
+            for _, new, _ in plausible:
+                new.match_ambiguous = True
+            warnings.append(
+                f"Ambiguous cross-file similarity match for {old.qualified_name!r}; "
+                "treated conservatively."
+            )
+            continue
+        _, new, new_file = plausible[0]
+        pairs.append((old, old_file, new, new_file))
+        matched_old.add(id(old))
+        matched_new.add(id(new))
+
+    unmatched_removed = [item for item in removed if id(item[0]) not in matched_old]
+    unmatched_added = [item for item in added if id(item[0]) not in matched_new]
+    return pairs, unmatched_removed, unmatched_added, warnings
 
 
 def analyze_ast(files: list[ChangedFile]) -> AstAnalysis:
@@ -650,6 +869,7 @@ def analyze_ast(files: list[ChangedFile]) -> AstAnalysis:
     parsed_files = 0
     failed_files = 0
     changed_symbol_keys: set[tuple[str, str]] = set()
+    parsed: list[tuple[ChangedFile, list[SymbolSnapshot], list[SymbolSnapshot]]] = []
     for changed in files:
         path = changed.path
         try:
@@ -694,13 +914,103 @@ def analyze_ast(files: list[ChangedFile]) -> AstAnalysis:
             changed_symbol_keys.add((path, "<unparsed>"))
             continue
         parsed_files += 1
+        parsed.append((changed, old_symbols, new_symbols))
+
+    removed: list[tuple[SymbolSnapshot, ChangedFile]] = []
+    added: list[tuple[SymbolSnapshot, ChangedFile]] = []
+    for changed, old_symbols, new_symbols in parsed:
+        path = changed.path
         pairs, match_warnings = _match_symbols(old_symbols, new_symbols)
         warnings.extend(match_warnings)
         for old, new in pairs:
-            symbol_deltas = _compare_symbol(path, old, new, changed.hunks)
+            if old is None:
+                added.append((new, changed))  # type: ignore[arg-type]
+                continue
+            if new is None:
+                removed.append((old, changed))
+                continue
+            symbol_deltas = _compare_symbol(
+                path,
+                old,
+                new,
+                changed.hunks,
+                old_path=changed.old_path or path,
+                new_path=changed.new_path or path,
+            )
             if symbol_deltas:
-                changed_symbol_keys.add((path, (new or old).qualified_name))  # type: ignore[union-attr]
+                changed_symbol_keys.add((path, new.qualified_name))
                 deltas.extend(symbol_deltas)
+
+    cross_pairs, removed, added, cross_warnings = _match_cross_file_symbols(removed, added)
+    warnings.extend(cross_warnings)
+    for old, old_file, new, new_file in cross_pairs:
+        path = new_file.path
+        symbol_deltas = _compare_symbol(
+            path,
+            old,
+            new,
+            new_file.hunks,
+            old_path=old_file.old_path or old_file.path,
+            new_path=new_file.new_path or new_file.path,
+            old_hunks=old_file.hunks,
+            new_hunks=new_file.hunks,
+        )
+        if symbol_deltas:
+            changed_symbol_keys.add((path, new.qualified_name))
+            deltas.extend(symbol_deltas)
+    for old, changed in removed:
+        path = changed.old_path or changed.path
+        symbol_deltas = _compare_symbol(
+            path,
+            old,
+            None,
+            changed.hunks,
+            old_path=path,
+            new_path=changed.new_path or path,
+        )
+        if symbol_deltas:
+            changed_symbol_keys.add((path, old.qualified_name))
+            deltas.extend(symbol_deltas)
+    for new, changed in added:
+        path = changed.new_path or changed.path
+        symbol_deltas = _compare_symbol(
+            path,
+            None,
+            new,
+            changed.hunks,
+            old_path=changed.old_path or path,
+            new_path=path,
+        )
+        if symbol_deltas:
+            changed_symbol_keys.add((path, new.qualified_name))
+            deltas.extend(symbol_deltas)
+
+    # A module snapshot is always recorded, but its generic add/remove/refactor evidence is
+    # redundant when a more precise symbol in the same file already explains the hunk.
+    detailed_paths: set[str] = set()
+    for item in deltas:
+        if item.symbol == "<module>":
+            continue
+        detailed_paths.add(item.path)
+        detailed_paths.update(
+            path
+            for key in ("old_path", "new_path")
+            if isinstance((path := item.metadata.get(key)), str)
+        )
+    deltas = [
+        item
+        for item in deltas
+        if not (
+            item.symbol == "<module>"
+            and item.path in detailed_paths
+            and item.kind in {"symbol_added", "symbol_removed", "structural_refactor"}
+        )
+    ]
+    changed_symbol_keys = {
+        key
+        for key in changed_symbol_keys
+        if not (key[1] == "<module>" and key[0] in detailed_paths)
+    }
     return AstAnalysis(
         deltas=deltas,
         warnings=warnings,

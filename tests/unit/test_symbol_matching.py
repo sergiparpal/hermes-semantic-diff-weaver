@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from hermes_semantic_diff_weaver.ast_diff import analyze_ast
 from hermes_semantic_diff_weaver.git_diff import ChangedFile, Hunk
+from hermes_semantic_diff_weaver.semantic_candidates import build_candidates
 
 
 def file(old: str, new: str) -> ChangedFile:
@@ -35,6 +36,10 @@ def test_ambiguous_rename_is_not_forced() -> None:
     assert result.warnings
     assert any(item.kind == "symbol_removed" for item in result.deltas)
     assert sum(item.kind == "symbol_added" for item in result.deltas) == 2
+    assert all(item.metadata["ambiguous_match"] for item in result.deltas)
+    assert all(
+        candidate.confidence_baseline == 0.42 for candidate in build_candidates(result.deltas)
+    )
 
 
 def test_conservative_similarity_matches_a_rename_with_a_small_body_change() -> None:
@@ -43,3 +48,44 @@ def test_conservative_similarity_matches_a_rename_with_a_small_body_change() -> 
     )
     assert any(item.kind == "return_change" for item in result.deltas)
     assert not any(item.kind in {"symbol_added", "symbol_removed"} for item in result.deltas)
+
+
+def test_cross_file_function_move_is_correlated_without_add_remove_claims() -> None:
+    removed = ChangedFile(
+        status="D",
+        old_path="src/old.py",
+        new_path=None,
+        old_text="def moved(x):\n    return x + 1\n",
+        new_text=None,
+        hunks=[Hunk(id="hunk-001", old_start=1, old_count=2, new_start=0, new_count=0)],
+    )
+    added = ChangedFile(
+        status="A",
+        old_path=None,
+        new_path="src/new.py",
+        old_text=None,
+        new_text="def moved(x):\n    return x + 1\n",
+        hunks=[Hunk(id="hunk-001", old_start=0, old_count=0, new_start=1, new_count=2)],
+    )
+    result = analyze_ast([removed, added])
+    assert [(item.path, item.symbol, item.kind) for item in result.deltas] == [
+        ("src/new.py", "moved", "structural_refactor")
+    ]
+    assert result.deltas[0].metadata["old_path"] == "src/old.py"
+
+
+def test_overload_style_duplicate_names_are_all_preserved() -> None:
+    old = """\
+@overload
+def parse(value: int) -> int: ...
+@overload
+def parse(value: str) -> str: ...
+def parse(value):
+    return value
+"""
+    new = old.replace("value: str) -> str", "value: bytes) -> bytes")
+    result = analyze_ast([file(old, new)])
+    signature_deltas = [item for item in result.deltas if item.kind == "signature_change"]
+    assert len(signature_deltas) == 1
+    assert "str" in (signature_deltas[0].old or "")
+    assert "bytes" in (signature_deltas[0].new or "")

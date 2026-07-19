@@ -7,7 +7,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from .errors import ErrorCode, WeaverError
 from .models import (
@@ -24,6 +24,17 @@ from .schemas import LLM_RESPONSE_SCHEMA, LLM_SCHEMA_NAME
 from .semantic_candidates import SemanticCandidate
 
 MAX_LLM_RESPONSE_CHARS = 200_000
+UNINFORMATIVE_SHARED_CALLS = {
+    "bool",
+    "dict",
+    "int",
+    "len",
+    "list",
+    "set",
+    "str",
+    "super",
+    "tuple",
+}
 INPUT_PREFIX = "<UNTRUSTED_SEMANTIC_DIFF_EVIDENCE>\n"
 INPUT_SUFFIX = "\n</UNTRUSTED_SEMANTIC_DIFF_EVIDENCE>"
 
@@ -149,16 +160,50 @@ def _critical_weight(batch: EvidenceBatch, config: WeaverConfig) -> int:
 def _batch_candidates(
     candidates: list[SemanticCandidate], config: WeaverConfig
 ) -> tuple[list[EvidenceBatch], int, int]:
-    grouped: dict[str, list[SemanticCandidate]] = defaultdict(list)
-    for candidate in candidates:
-        grouped[candidate.path].append(candidate)
+    # Build connected components so same-module symbols and cross-module changes to a shared
+    # dependency stay together until the per-call character cap requires a split.
+    parents = list(range(len(candidates)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    seen_paths: dict[str, int] = {}
+    seen_calls: dict[str, int] = {}
+    for index, candidate in enumerate(candidates):
+        if candidate.path in seen_paths:
+            union(index, seen_paths[candidate.path])
+        else:
+            seen_paths[candidate.path] = index
+        for call in sorted(candidate.related_calls - UNINFORMATIVE_SHARED_CALLS):
+            if call in seen_calls:
+                union(index, seen_calls[call])
+            else:
+                seen_calls[call] = index
+    grouped: dict[int, list[SemanticCandidate]] = defaultdict(list)
+    for index, candidate in enumerate(candidates):
+        grouped[find(index)].append(candidate)
     batches: list[EvidenceBatch] = []
     truncated_symbols = 0
     oversized_symbols = 0
-    for path in sorted(grouped):
+    groups = sorted(
+        grouped.values(),
+        key=lambda items: min((item.path, item.symbol, item.category.value) for item in items),
+    )
+    for group in groups:
         current: list[SemanticCandidate] = []
         current_items: list[dict[str, Any]] = []
-        for candidate in grouped[path]:
+        for candidate in sorted(
+            group, key=lambda item: (item.path, item.symbol, item.category.value)
+        ):
             item, truncated = _evidence_payload(candidate, config)
             truncated_symbols += int(truncated)
             proposed_items = (*current_items, item)
@@ -226,8 +271,14 @@ def _accumulate_usage(current: LlmUsage | None, result: Any) -> LlmUsage | None:
     if usage is None:
         return current
     input_tokens = _usage_value(usage, "input_tokens")
+    if input_tokens is None:
+        input_tokens = _usage_value(usage, "prompt_tokens")
     output_tokens = _usage_value(usage, "output_tokens")
+    if output_tokens is None:
+        output_tokens = _usage_value(usage, "completion_tokens")
     cost = _usage_value(usage, "cost_usd")
+    if cost is None:
+        cost = _usage_value(usage, "cost")
     if input_tokens is None and output_tokens is None and cost is None:
         return current
     current = current or LlmUsage()
@@ -328,6 +379,8 @@ def interpret_candidates(
                 ):
                     raise ValueError("structured result unavailable")
                 parsed_value = _result_value(result, "parsed")
+                if isinstance(parsed_value, BaseModel):
+                    parsed_value = parsed_value.model_dump(mode="json")
                 encoded = json.dumps(parsed_value, ensure_ascii=False, sort_keys=True)
                 if len(encoded) > MAX_LLM_RESPONSE_CHARS:
                     raise ValueError("structured result exceeded the response limit")

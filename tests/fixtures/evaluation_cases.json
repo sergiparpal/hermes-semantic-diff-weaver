@@ -16,6 +16,14 @@
     "obligation_concepts": ["omitted-input behavior"]
   },
   {
+    "name": "return annotation signature",
+    "old_files": {"src/case.py": "def render(value: int) -> int:\n    return value\n"},
+    "new_files": {"src/case.py": "def render(value: int) -> str:\n    return value\n"},
+    "expected": ["output_contract_change"],
+    "anchors": [{"path": "src/case.py", "symbol": "render", "kind": "signature_change"}],
+    "obligation_concepts": ["consumer-visible contract"]
+  },
+  {
     "name": "exception type",
     "old_files": {"src/case.py": "def run():\n    raise ValueError()\n"},
     "new_files": {"src/case.py": "def run():\n    raise TypeError()\n"},
@@ -98,9 +106,14 @@
   },
   {
     "name": "moved renamed function",
-    "old_files": {"src/old.py": "def old_name(x):\n    return x + 1\n"},
-    "new_files": {"src/new.py": "def new_name(x):\n    return x + 1\n"},
-    "remove": ["src/old.py"],
+    "old_files": {
+      "src/old.py": "def old_name(x):\n    return x + 1\n\ndef stays_old():\n    return 'old'\n",
+      "src/new.py": "def stays_new():\n    return 'new'\n"
+    },
+    "new_files": {
+      "src/old.py": "def stays_old():\n    return 'old'\n",
+      "src/new.py": "def stays_new():\n    return 'new'\n\ndef new_name(x):\n    return x + 1\n"
+    },
     "expected": [],
     "anchors": [],
     "obligation_concepts": [],

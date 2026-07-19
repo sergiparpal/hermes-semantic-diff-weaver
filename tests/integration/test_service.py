@@ -44,6 +44,23 @@ def test_no_python_change_is_successful_empty_analysis(repo_factory) -> None:
     assert any("no included changed Python" in item for item in result["limitations"])
 
 
+def test_empty_python_file_change_is_a_successful_empty_analysis(repo_factory) -> None:
+    repo, base, head = repo_factory(
+        {"README.md": "base\n"}, {"README.md": "base\n", "empty.py": ""}
+    )
+    result = analyze(
+        {
+            "repo_path": str(repo),
+            "base_ref": base,
+            "head_ref": head,
+            "output_format": "json",
+        }
+    )
+    assert result["success"] is True
+    assert result["behavior_changes"] == []
+    assert any("no reportable behavior-bearing" in item for item in result["limitations"])
+
+
 def test_parse_failures_retain_bounded_evidence_and_continue(repo_factory) -> None:
     repo, base, head = repo_factory(
         {"good.py": "def f(x):\n    return x < 2\n", "bad.py": "def broken(:\n"},

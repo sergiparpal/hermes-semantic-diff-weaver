@@ -26,6 +26,10 @@ def test_extracts_required_structural_delta_classes() -> None:
     assert "signature_change" in kinds(
         "def run(limit=2):\n    return limit\n", "def run(limit=3):\n    return limit\n"
     )
+    assert "signature_change" in kinds(
+        "def run(value: int) -> int:\n    return value\n",
+        "def run(value: int) -> str:\n    return value\n",
+    )
     assert "raise_change" in kinds(
         "def run():\n    raise ValueError()\n", "def run():\n    raise TypeError()\n"
     )

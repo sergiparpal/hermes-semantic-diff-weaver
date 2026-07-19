@@ -22,6 +22,9 @@ import.
 - Binary, oversized, non-UTF-8, credential-named, cache, environment, and control files are omitted
   visibly.
 - Obvious inline token/private-key forms are redacted before evidence, model input, output, or errors.
+- Decorator arguments are never retained as evidence; only bounded decorator names are recorded.
+- Candidate-test indexing is bounded by per-file size and aggregate file/byte ceilings; reaching an
+  aggregate ceiling marks mapping incomplete instead of silently claiming a complete index.
 - Model input separates trusted instructions from delimited untrusted evidence. Output may reference
   only deterministic evidence IDs and cannot trigger reads, tools, subprocesses, network access, or
   configuration changes.

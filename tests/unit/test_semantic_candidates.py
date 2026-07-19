@@ -3,8 +3,10 @@ from __future__ import annotations
 import pytest
 
 from hermes_semantic_diff_weaver.ast_diff import StructuralDelta
-from hermes_semantic_diff_weaver.models import BehaviorCategory, LineRange
-from hermes_semantic_diff_weaver.semantic_candidates import build_candidates
+from hermes_semantic_diff_weaver.models import BehaviorCategory, Evidence, LineRange, Origin
+from hermes_semantic_diff_weaver.scoring import confidence_score
+from hermes_semantic_diff_weaver.semantic_candidates import SemanticCandidate, build_candidates
+from hermes_semantic_diff_weaver.service import _deduplicate_candidates
 
 
 def delta(kind: str, old: str | None, new: str | None) -> StructuralDelta:
@@ -59,6 +61,10 @@ def test_complete_taxonomy_rules(change: StructuralDelta, category: BehaviorCate
     candidates = build_candidates([change])
     assert candidates[0].category is category
     assert candidates[0].evidence[0].id == "ev-001"
+    complete_confidence = confidence_score(candidates[0])
+    candidates[0].evidence[0].parser_complete = False
+    candidates[0].assumptions.append("An external runtime contract is unavailable.")
+    assert confidence_score(candidates[0], truncated=True) < complete_confidence
 
 
 def test_same_symbol_category_merges_evidence() -> None:
@@ -70,3 +76,25 @@ def test_same_symbol_category_merges_evidence() -> None:
     )
     assert len(candidates) == 1
     assert [item.id for item in candidates[0].evidence] == ["ev-001", "ev-002"]
+
+
+def test_overlapping_deterministic_and_llm_candidates_merge_evidence() -> None:
+    deterministic = build_candidates([delta("comparison_change", "x < 1", "x <= 1")])[0]
+    llm_supported = SemanticCandidate(
+        category=deterministic.category,
+        summary="The exact boundary is included.",
+        observable_impact=deterministic.observable_impact,
+        evidence=[
+            deterministic.evidence[0],
+            Evidence(id="ev-999", path="src/policy.py", symbol="Policy.apply", kind="condition"),
+        ],
+        confidence_baseline=0.97,
+        origin=Origin.LLM_SUPPORTED,
+        rule_ids=["SDW-LLM-SUPPORTED"],
+        related_paths={"src/policy.py"},
+    )
+    merged = _deduplicate_candidates([deterministic, llm_supported])
+    assert len(merged) == 1
+    assert [item.id for item in merged[0].evidence] == ["ev-001", "ev-999"]
+    assert merged[0].origin is Origin.LLM_SUPPORTED
+    assert merged[0].summary == "The exact boundary is included."

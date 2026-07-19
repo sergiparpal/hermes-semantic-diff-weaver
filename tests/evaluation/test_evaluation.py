@@ -18,6 +18,38 @@ def test_fixture_labels_match_reviewed_golden() -> None:
     assert labels == golden
 
 
+def _normalize_analysis(result: dict[str, object]) -> dict[str, object]:
+    normalized = json.loads(json.dumps(result, sort_keys=True))
+    normalized["analysis_id"] = "<analysis-id>"
+    normalized["repository"] = {
+        "path": ".",
+        "base_ref": "<base-ref>",
+        "head_ref": "<head-ref>",
+        "base_commit": "<base-commit>",
+        "head_commit": "<head-commit>",
+    }
+    return normalized
+
+
+def test_canonical_outputs_match_reviewed_goldens(repo_factory) -> None:
+    golden_path = Path(__file__).parents[1] / "fixtures" / "golden" / "canonical_outputs.json"
+    golden = json.loads(golden_path.read_text(encoding="utf-8"))
+    actual: dict[str, dict[str, object]] = {}
+    for case in _load_cases():
+        old_files, new_files, remove = _files(case)
+        repo, base, head = repo_factory(old_files, new_files, remove=remove)
+        result = analyze(
+            {
+                "repo_path": str(repo),
+                "base_ref": base,
+                "head_ref": head,
+                "output_format": "json",
+            }
+        )
+        actual[case["name"]] = _normalize_analysis(result)
+    assert actual == golden
+
+
 def _files(case: dict[str, object]) -> tuple[dict[str, str], dict[str, str], tuple[str, ...]]:
     if case.get("generator") == "oversized_critical":
         config = (

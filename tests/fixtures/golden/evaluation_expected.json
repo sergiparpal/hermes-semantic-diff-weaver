@@ -11,6 +11,7 @@
   "no changed Python source": [],
   "output field": ["output_contract_change"],
   "oversized critical path prioritization": ["boundary_change"],
+  "return annotation signature": ["output_contract_change"],
   "retry predicate": ["retry_timeout_change"],
   "side effect": ["side_effect_change"],
   "stable refactor": [],

@@ -64,4 +64,4 @@ def test_full_deterministic_pipeline_near_default_limits(repo_factory) -> None:
     assert result["scope"]["changed_files_total"] == 40
     assert result["scope"]["changed_lines"] == 3000
     assert result["scope"]["changed_symbols"] == 100
-    assert elapsed < 10.0
+    assert elapsed < 5.0

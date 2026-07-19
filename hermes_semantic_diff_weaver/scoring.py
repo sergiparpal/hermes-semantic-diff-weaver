@@ -76,7 +76,7 @@ def score_risk(
     config: WeaverConfig,
 ) -> tuple[int, RiskLabel, ScoreExplanation]:
     impact = IMPACT[candidate.category]
-    if candidate.symbol.startswith("_"):
+    if candidate.symbol.rsplit(".", 1)[-1].startswith("_"):
         impact = max(0, impact - 8)
     critical = max(
         (
@@ -102,7 +102,8 @@ def score_risk(
             if candidate.category
             in {BehaviorCategory.SIDE_EFFECT, BehaviorCategory.DEPENDENCY_INTERACTION}
             else 0
-        ),
+        )
+        + (20 if len(candidate.related_paths) > 1 else 0),
     )
     explanation = ScoreExplanation(
         behavioral_impact=impact,

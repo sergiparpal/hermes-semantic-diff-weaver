@@ -11,6 +11,9 @@
 - Complete conservative rename matching, parse-incomplete unknown findings, critical-path resource
   prioritization, bounded README/model context, schema retry/reconciliation limits, and explicit scope
   truncation reporting.
-- Expand the corpus to 16 golden cases, enforce overall and critical-module coverage policy, add a
-  full-pipeline performance fixture, and add clean-wheel plus real Hermes 0.14.0 discovery gates.
+- Expand the corpus, enforce overall and critical-module coverage policy, add a full-pipeline
+  performance fixture, and add clean-wheel plus real Hermes 0.14.0/0.18.2 discovery gates.
+- Complete return-annotation signature detection, method/module inventory, overload preservation,
+  cross-file symbol moves, semantic obligation merging, shared-call LLM batching, and aggregate
+  candidate-test index bounds; expand the reviewed corpus to 17 cases.
 - License the project under MIT.

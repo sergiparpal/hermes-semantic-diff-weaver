@@ -3,7 +3,9 @@ from __future__ import annotations
 from hermes_semantic_diff_weaver.models import (
     BehaviorCategory,
     BehaviorChange,
+    CandidateTest,
     Evidence,
+    ObligationType,
     Origin,
     Presentation,
     RiskLabel,
@@ -11,6 +13,7 @@ from hermes_semantic_diff_weaver.models import (
     WeaverConfig,
 )
 from hermes_semantic_diff_weaver.obligations import generate_obligations
+from hermes_semantic_diff_weaver.semantic_interpreter import SuggestedScenario
 
 
 def behavior(category: BehaviorCategory, index: int = 1, risk: RiskLabel = RiskLabel.HIGH):
@@ -79,6 +82,55 @@ def test_equivalent_templates_do_not_remove_another_high_risk_behaviors_obligati
         behavior_id for obligation in obligations for behavior_id in obligation.behavior_change_ids
     }
     assert {"bc-001", "bc-002"} <= linked
+    assert len(obligations) == 3
+    assert all(item.behavior_change_ids == ["bc-001", "bc-002"] for item in obligations)
+
+
+def test_merged_obligations_union_and_cap_candidate_tests() -> None:
+    candidate_tests = {
+        f"bc-{behavior_index:03d}": [
+            CandidateTest(
+                path=f"tests/test_{behavior_index}_{test_index}.py",
+                symbol=f"test_case_{test_index}",
+                match_score=0.5 + test_index / 100,
+                match_reasons=["direct module or symbol import"],
+            )
+            for test_index in range(4)
+        ]
+        for behavior_index in (1, 2)
+    }
+    obligations, _ = generate_obligations(
+        [
+            behavior(BehaviorCategory.BOUNDARY, index=1),
+            behavior(BehaviorCategory.BOUNDARY, index=2),
+        ],
+        candidate_tests,
+        False,
+        WeaverConfig(),
+    )
+    assert all(len(item.candidate_existing_tests) == 5 for item in obligations)
+    assert all(item.coverage_status.value == "candidate_exists_unverified" for item in obligations)
+
+
+def test_duplicate_llm_obligations_are_semantically_deduplicated() -> None:
+    suggestion = SuggestedScenario(
+        evidence_ids=("ev-001",),
+        type=ObligationType.BOUNDARY,
+        title="Model boundary scenario",
+        given="A specially selected boundary input",
+        when="The boundary operation runs",
+        then="The intended boundary outcome is visible",
+    )
+    obligations, _ = generate_obligations(
+        [behavior(BehaviorCategory.BOUNDARY)],
+        {},
+        False,
+        WeaverConfig(),
+        [suggestion, suggestion],
+    )
+    assert len(obligations) == 4
+    model_obligation = next(item for item in obligations if item.title == "Model boundary scenario")
+    assert model_obligation.origin is Origin.LLM_SUPPORTED
 
 
 def test_global_cap_groups_overflowing_high_risk_behavior_links() -> None:
@@ -94,5 +146,5 @@ def test_global_cap_groups_overflowing_high_risk_behavior_links() -> None:
         behavior_id for obligation in obligations for behavior_id in obligation.behavior_change_ids
     }
     assert len(obligations) == 2
-    assert omitted == 7
+    assert omitted == 1
     assert linked == {"bc-001", "bc-002", "bc-003"}
