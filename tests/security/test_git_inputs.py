@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -78,6 +79,10 @@ def test_committed_symlink_is_metadata_and_is_not_read(tmp_path: Path) -> None:
     assert result.excluded_counts["symlink_or_gitlink"] == 1
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows filesystems cannot represent filenames containing newline characters.",
+)
 def test_newline_filename_is_parsed_without_record_corruption(repo_factory) -> None:
     path = "src/line\nbreak.py"
     repo, base, head = repo_factory(

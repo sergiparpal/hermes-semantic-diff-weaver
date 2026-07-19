@@ -45,7 +45,7 @@ def repo_factory(tmp_path: Path) -> Callable[..., tuple[Path, str, str]]:
         for relative, text in old_files.items():
             path = repo / relative
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, encoding="utf-8")
+            path.write_text(text, encoding="utf-8", newline="")
         git(repo, "add", "--all")
         git(repo, "commit", "-q", "-m", "base")
         base = git(repo, "rev-parse", "HEAD")
@@ -56,7 +56,7 @@ def repo_factory(tmp_path: Path) -> Callable[..., tuple[Path, str, str]]:
         for relative, text in new_files.items():
             path = repo / relative
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, encoding="utf-8")
+            path.write_text(text, encoding="utf-8", newline="")
         git(repo, "add", "--all")
         git(repo, "commit", "-q", "-m", "head")
         head = git(repo, "rev-parse", "HEAD")

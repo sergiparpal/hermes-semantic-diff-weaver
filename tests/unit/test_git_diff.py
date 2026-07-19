@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 
 from hermes_semantic_diff_weaver.errors import ErrorCode, WeaverError
-from hermes_semantic_diff_weaver.git_diff import GitRepository, _parse_numstat, collect_diff
+from hermes_semantic_diff_weaver.git_diff import (
+    GitRepository,
+    _parse_name_status,
+    _parse_numstat,
+    collect_diff,
+)
 from hermes_semantic_diff_weaver.models import CriticalPath, WeaverConfig
 
 
@@ -24,6 +29,20 @@ def test_open_resolve_and_collect(repo_factory) -> None:
     assert result.files[0].old_text
     assert result.files[0].new_text
     assert result.files[0].hunks
+    assert result.changed_lines == 2
+
+
+def test_crlf_move_and_rename_is_correlated(repo_factory) -> None:
+    repo_path, base, head = repo_factory(
+        {"src/old.py": "def old_name(x):\r\n    return x + 1\r\n"},
+        {"src/new.py": "def new_name(x):\r\n    return x + 1\r\n"},
+        remove=("src/old.py",),
+    )
+    result = collect_diff(GitRepository.open(str(repo_path)), base, head, WeaverConfig())
+    assert len(result.files) == 1
+    assert result.files[0].status.startswith("R")
+    assert result.files[0].old_path == "src/old.py"
+    assert result.files[0].new_path == "src/new.py"
     assert result.changed_lines == 2
 
 
@@ -172,6 +191,18 @@ def test_blob_and_tree_edge_cases_are_bounded(tmp_path: Path, monkeypatch) -> No
 def test_malformed_and_truncated_numstat_records_are_ignored() -> None:
     assert _parse_numstat(b"malformed\x00") == ({}, 0)
     assert _parse_numstat(b"1\t1\t\x00") == ({}, 0)
+
+
+def test_nul_delimited_metadata_preserves_newline_filename() -> None:
+    path = "src/line\nbreak.py"
+    changed = _parse_name_status(b"M\x00" + path.encode("utf-8") + b"\x00")
+    assert len(changed) == 1
+    assert changed[0].old_path == path
+    assert changed[0].new_path == path
+    assert _parse_numstat(b"1\t1\t" + path.encode("utf-8") + b"\x00") == (
+        {path: (1, 1, False)},
+        2,
+    )
 
 
 def test_critical_prioritization_requires_a_match_and_respects_line_budget(

@@ -16,6 +16,8 @@ from .path_policy import exclusion_reason, glob_matches, is_included, normalize_
 
 GIT_TIMEOUT_SECONDS = 15
 MAX_GIT_OUTPUT_BYTES = 16 * 1024 * 1024
+# Git's 50% default misses small CRLF renames; AST matching still rejects ambiguous symbols.
+RENAME_DETECTION_ARGUMENTS = ("-M40%", "-C40%")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40,64}$")
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -440,8 +442,7 @@ def collect_diff(
             "--no-textconv",
             "--name-status",
             "-z",
-            "-M",
-            "-C",
+            *RENAME_DETECTION_ARGUMENTS,
             base_commit,
             head_commit,
             "--",
@@ -456,6 +457,7 @@ def collect_diff(
             "--no-textconv",
             "--numstat",
             "-z",
+            *RENAME_DETECTION_ARGUMENTS,
             base_commit,
             head_commit,
             "--",
