@@ -13,28 +13,28 @@ from tests.conftest import git
 
 def test_git_runner_never_uses_shell(repo_factory, monkeypatch) -> None:
     repo_path, base, head = repo_factory({"a.py": "x = 1\n"}, {"a.py": "x = 2\n"})
-    real_run = subprocess.run
+    real_popen = subprocess.Popen
     observed: list[object] = []
 
     def spy(*args, **kwargs):
         observed.append(kwargs.get("shell"))
-        return real_run(*args, **kwargs)
+        return real_popen(*args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", spy)
+    monkeypatch.setattr(subprocess, "Popen", spy)
     collect_diff(GitRepository.open(str(repo_path)), base, head, WeaverConfig())
     assert observed and all(value is False for value in observed)
 
 
 def test_git_runner_disables_global_config_attributes_and_paging(repo_factory, monkeypatch) -> None:
     repo_path, base, head = repo_factory({"a.py": "x = 1\n"}, {"a.py": "x = 2\n"})
-    real_run = subprocess.run
+    real_popen = subprocess.Popen
     observed: list[tuple[list[str], dict[str, str]]] = []
 
     def spy(*args, **kwargs):
         observed.append((args[0], kwargs["env"]))
-        return real_run(*args, **kwargs)
+        return real_popen(*args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", spy)
+    monkeypatch.setattr(subprocess, "Popen", spy)
     collect_diff(GitRepository.open(str(repo_path)), base, head, WeaverConfig())
     assert observed
     for command, environment in observed:

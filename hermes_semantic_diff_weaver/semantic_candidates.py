@@ -2,14 +2,45 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from .ast_diff import StructuralDelta
 from .models import BehaviorCategory, Evidence, Origin, WeaverConfig
 
-AUTH_TERMS = ("auth", "permission", "permit", "role", "owner", "identity", "principal")
-VALIDATION_TERMS = ("valid", "validate", "validator", "allowed", "reject", "accept")
-RETRY_TERMS = ("retry", "attempt", "timeout", "sleep", "backoff", "deadline", "limit")
+AUTH_TERMS = (
+    "auth",
+    "authenticate",
+    "authentication",
+    "authorize",
+    "authorization",
+    "permission",
+    "permit",
+    "role",
+    "owner",
+    "identity",
+    "principal",
+)
+VALIDATION_TERMS = (
+    "valid",
+    "validate",
+    "validation",
+    "validator",
+    "allowed",
+    "reject",
+    "accept",
+)
+RETRY_TERMS = (
+    "retry",
+    "retries",
+    "attempt",
+    "attempts",
+    "timeout",
+    "sleep",
+    "backoff",
+    "deadline",
+    "limit",
+)
 SIDE_EFFECT_TERMS = (
     "save",
     "write",
@@ -49,8 +80,9 @@ class SemanticCandidate:
 
 
 def _contains(text: str, terms: tuple[str, ...]) -> bool:
-    lowered = text.casefold()
-    return any(term in lowered for term in terms)
+    camel_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
+    tokens = set(re.findall(r"[a-z0-9]+", camel_split.casefold()))
+    return bool(tokens.intersection(terms))
 
 
 def _classification(

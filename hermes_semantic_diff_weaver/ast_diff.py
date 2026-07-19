@@ -90,15 +90,20 @@ class FeatureVisitor(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         if node is self.root:
-            self.generic_visit(node)
+            self._visit_root_body(node.body)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         if node is self.root:
-            self.generic_visit(node)
+            self._visit_root_body(node.body)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         if node is self.root:
-            self.generic_visit(node)
+            self._visit_root_body(node.body)
+
+    def _visit_root_body(self, body: list[ast.stmt]) -> None:
+        """Visit executable statements without retaining definition metadata values."""
+        for statement in body:
+            self.visit(statement)
 
     def visit_Compare(self, node: ast.Compare) -> None:
         operators = ",".join(type(item).__name__ for item in node.ops)
@@ -232,9 +237,9 @@ def _defaults(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, str]:
             positional[-len(node.args.defaults) :], node.args.defaults, strict=True
         ):
             result[argument.arg] = _compact(default, 200)
-    for argument, default in zip(node.args.kwonlyargs, node.args.kw_defaults, strict=True):
-        if default is not None:
-            result[argument.arg] = _compact(default, 200)
+    for argument, kw_default in zip(node.args.kwonlyargs, node.args.kw_defaults, strict=True):
+        if kw_default is not None:
+            result[argument.arg] = _compact(kw_default, 200)
     return result
 
 
@@ -319,7 +324,7 @@ def extract_symbols(source: str) -> list[SymbolSnapshot]:
                         else "function"
                     )
                 symbols.append(_snapshot(statement, name, kind))
-                nested = [
+                nested: list[ast.stmt] = [
                     item
                     for item in statement.body
                     if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
@@ -446,6 +451,7 @@ def _compare_symbol(
     if hunk_id is None:
         return []
     if old is None:
+        assert new is not None
         return [
             _delta(
                 path,
@@ -873,7 +879,11 @@ def analyze_ast(files: list[ChangedFile]) -> AstAnalysis:
     for changed in files:
         path = changed.path
         try:
-            old_symbols = extract_symbols(changed.old_text) if changed.old_text is not None else []
+            old_symbols = (
+                extract_symbols(changed.old_text)
+                if changed.old_text is not None and not changed.status.startswith("C")
+                else []
+            )
             new_symbols = extract_symbols(changed.new_text) if changed.new_text is not None else []
         except (SyntaxError, ValueError, TypeError):
             failed_files += 1
@@ -992,11 +1002,10 @@ def analyze_ast(files: list[ChangedFile]) -> AstAnalysis:
         if item.symbol == "<module>":
             continue
         detailed_paths.add(item.path)
-        detailed_paths.update(
-            path
-            for key in ("old_path", "new_path")
-            if isinstance((path := item.metadata.get(key)), str)
-        )
+        for key in ("old_path", "new_path"):
+            metadata_path = item.metadata.get(key)
+            if isinstance(metadata_path, str):
+                detailed_paths.add(metadata_path)
     deltas = [
         item
         for item in deltas

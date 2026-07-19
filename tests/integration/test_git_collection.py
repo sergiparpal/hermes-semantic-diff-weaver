@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from hermes_semantic_diff_weaver.ast_diff import analyze_ast
 from hermes_semantic_diff_weaver.git_diff import GitRepository, collect_diff
 from hermes_semantic_diff_weaver.models import WeaverConfig
 
@@ -36,3 +37,20 @@ def test_exact_file_rename_metadata_is_preserved(repo_factory) -> None:
     assert result.files[0].status.startswith("R")
     assert result.files[0].old_path == "src/old.py"
     assert result.files[0].new_path == "src/new.py"
+
+
+def test_detected_copy_is_analyzed_as_new_surface(repo_factory) -> None:
+    original = "def copied():\n    return 1\n"
+    repo_path, base, head = repo_factory(
+        {"src/original.py": original},
+        {
+            "src/original.py": "def copied():\n    return 2\n",
+            "src/copied.py": original,
+        },
+    )
+    result = collect_diff(GitRepository.open(str(repo_path)), base, head, WeaverConfig())
+    copied = next(item for item in result.files if item.path == "src/copied.py")
+    assert copied.status.startswith("C")
+    assert copied.hunks[0].new_start == 1
+    deltas = analyze_ast([copied]).deltas
+    assert any(item.kind == "symbol_added" and item.symbol == "copied" for item in deltas)

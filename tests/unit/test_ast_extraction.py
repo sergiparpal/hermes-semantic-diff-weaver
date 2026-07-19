@@ -31,6 +31,10 @@ def test_decorator_arguments_are_never_retained_as_context() -> None:
     )
     endpoint = next(item for item in symbols if item.qualified_name == "endpoint")
     assert endpoint.decorators == ("route",)
+    serialized_features = repr(endpoint.features)
+    assert "/private/path" not in serialized_features
+    assert "must-not-leak" not in serialized_features
+    assert endpoint.features["calls"] == ()
 
 
 def test_docstrings_and_formatting_do_not_change_fingerprint() -> None:

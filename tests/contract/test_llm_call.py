@@ -14,7 +14,12 @@ from hermes_semantic_diff_weaver.models import (
     WeaverConfig,
 )
 from hermes_semantic_diff_weaver.semantic_candidates import build_candidates
-from hermes_semantic_diff_weaver.semantic_interpreter import interpret_candidates
+from hermes_semantic_diff_weaver.semantic_interpreter import (
+    _accumulate_usage,
+    _batch_candidates,
+    _evidence_payload,
+    interpret_candidates,
+)
 
 
 @dataclass
@@ -180,6 +185,55 @@ def test_model_input_and_per_symbol_evidence_are_bounded() -> None:
     assert len(llm.calls[0]["input"][0]["text"]) <= 1024
 
 
+def test_evidence_compaction_removes_snippets_and_extra_records() -> None:
+    item = candidate()
+    item.evidence[0].old = "old" * 1000
+    item.evidence[0].new = "new" * 1000
+    for index in range(2, 5):
+        duplicate = item.evidence[0].model_copy(deep=True)
+        duplicate.id = f"ev-{index:03d}"
+        item.evidence.append(duplicate)
+    config = WeaverConfig()
+    config.rules.max_evidence_chars_per_symbol = 256
+    payload, truncated = _evidence_payload(item, config)
+    assert truncated is True
+    assert len(str(payload)) < 512
+    assert payload["omitted_evidence_count"] > 0
+
+
+def test_connected_evidence_groups_split_at_the_call_boundary() -> None:
+    items = []
+    for index in range(3):
+        item = candidate()
+        item.evidence[0].id = f"ev-{index + 1:03d}"
+        item.evidence[0].symbol = f"allowed_{index}"
+        item.evidence[0].old = "x" * 160
+        item.evidence[0].new = "y" * 160
+        items.append(item)
+    config = WeaverConfig()
+    config.rules.max_model_input_chars_per_call = 1024
+    batches, omitted, _ = _batch_candidates(items, config)
+    assert len(batches) >= 2
+    assert omitted == 0
+
+
+def test_usage_helpers_accept_object_values_and_ignore_empty_usage() -> None:
+    class EmptyUsage:
+        input_tokens = None
+        output_tokens = None
+        cost = None
+
+    class Usage:
+        input_tokens = 3
+        output_tokens = 2
+        cost = 0.01
+
+    assert _accumulate_usage(None, {"usage": EmptyUsage()}) is None
+    usage = _accumulate_usage(None, {"usage": Usage()})
+    assert usage is not None
+    assert (usage.input_tokens, usage.output_tokens, usage.cost) == (3, 2, 0.01)
+
+
 def test_schema_failure_retries_once_and_can_recover() -> None:
     invalid = valid_payload()
     invalid["behaviors"][0]["category"] = "invented_change"
@@ -187,6 +241,26 @@ def test_schema_failure_retries_once_and_can_recover() -> None:
     result = interpret_candidates([candidate()], llm, WeaverConfig())
     assert result.status.available is True
     assert result.status.calls == 2
+
+
+def test_retry_budget_exhaustion_reports_unvisited_batches() -> None:
+    first = candidate()
+    second = candidate()
+    second.evidence[0].id = "ev-002"
+    second.evidence[0].path = "src/second.py"
+    invalid = valid_payload()
+    invalid["behaviors"][0]["category"] = "invented_change"
+    config = WeaverConfig()
+    config.rules.max_llm_calls = 2
+    result = interpret_candidates(
+        [first, second],
+        FakeLlm([Result("json", invalid), Result("json", valid_payload())]),
+        config,
+    )
+    assert result.status.available is True
+    assert result.status.calls == 2
+    assert result.omitted_batches == 1
+    assert any("retries exhausted" in warning for warning in result.warnings)
 
 
 def test_excessive_assumptions_and_oversized_output_fail_closed() -> None:
@@ -220,6 +294,15 @@ def test_readme_context_is_bounded_redacted_and_untrusted() -> None:
     assert "[REDACTED]" in text
     assert "abcdefghijklmnopqrstuvwxyz" not in text
     assert len(text) <= 1024
+
+
+def test_readme_context_is_reduced_to_fit_the_call_cap() -> None:
+    config = WeaverConfig()
+    config.rules.max_readme_chars = 5000
+    config.rules.max_model_input_chars_per_call = 1024
+    llm = FakeLlm([Result("json", {"behaviors": [], "obligations": []})])
+    interpret_candidates([candidate()], llm, config, readme_excerpt="purpose " * 1000)
+    assert len(llm.calls[0]["input"][0]["text"]) <= 1024
 
 
 def test_critical_path_batches_are_prioritized_under_call_cap() -> None:

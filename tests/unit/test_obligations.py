@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from hermes_semantic_diff_weaver.models import (
     BehaviorCategory,
     BehaviorChange,
@@ -148,3 +150,47 @@ def test_global_cap_groups_overflowing_high_risk_behavior_links() -> None:
     assert len(obligations) == 2
     assert omitted == 1
     assert linked == {"bc-001", "bc-002", "bc-003"}
+
+
+def test_grouped_overflow_obligation_preserves_candidate_mapping() -> None:
+    config = WeaverConfig()
+    config.rules.max_test_obligations = 2
+    mapped = CandidateTest(
+        path="tests/test_a.py",
+        symbol="test_boundary",
+        match_score=0.8,
+        match_reasons=["direct module or symbol import"],
+    )
+    behaviors = [
+        behavior(BehaviorCategory.BOUNDARY, index=1),
+        behavior(BehaviorCategory.AUTHORIZATION, index=2),
+        behavior(BehaviorCategory.RETRY_TIMEOUT, index=3),
+    ]
+    for item in behaviors:
+        item.origin = Origin.LLM_SUPPORTED
+    obligations, _ = generate_obligations(
+        behaviors,
+        {"bc-003": [mapped]},
+        True,
+        config,
+    )
+    grouped = next(item for item in obligations if len(item.behavior_change_ids) > 1)
+    assert grouped.candidate_existing_tests == [mapped]
+    assert grouped.coverage_status.value == "candidate_exists_unverified"
+    assert grouped.origin is Origin.LLM_SUPPORTED
+
+
+@pytest.mark.parametrize("origin", [Origin.DETERMINISTIC, Origin.DETERMINISTIC_FALLBACK])
+def test_grouped_overflow_obligation_uses_conservative_origin(origin: Origin) -> None:
+    config = WeaverConfig()
+    config.rules.max_test_obligations = 2
+    behaviors = [
+        behavior(BehaviorCategory.BOUNDARY, index=1),
+        behavior(BehaviorCategory.AUTHORIZATION, index=2),
+        behavior(BehaviorCategory.RETRY_TIMEOUT, index=3),
+    ]
+    for item in behaviors:
+        item.origin = origin
+    obligations, _ = generate_obligations(behaviors, {}, False, config)
+    grouped = next(item for item in obligations if len(item.behavior_change_ids) > 1)
+    assert grouped.origin is origin

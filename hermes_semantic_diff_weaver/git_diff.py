@@ -6,9 +6,12 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import BinaryIO, Literal, overload
 
 from .errors import ErrorCode, WeaverError
 from .models import WeaverConfig
@@ -16,7 +19,12 @@ from .path_policy import exclusion_reason, glob_matches, is_included, normalize_
 
 GIT_TIMEOUT_SECONDS = 15
 MAX_GIT_OUTPUT_BYTES = 16 * 1024 * 1024
+HARD_MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
 MAX_GIT_INPUT_BYTES = 2 * 1024 * 1024
+MAX_SOURCE_FILE_BYTES = 8 * 1024 * 1024
+MAX_SOURCE_BLOB_BYTES = 64 * 1024 * 1024
+MAX_ANALYZED_FILES = 1000
+MAX_TREE_PATHS_PER_COMMAND = 256
 # Git's 50% default misses small CRLF renames; AST matching still rejects ambiguous symbols.
 RENAME_DETECTION_ARGUMENTS = ("-M40%", "-C40%")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40,64}$")
@@ -67,8 +75,109 @@ class GitTreeEntry:
     object_id: str
 
 
+@dataclass
+class _BlobBatch:
+    texts: dict[str, str | None]
+    failures: dict[str, str]
+
+
+class _OutputLimitExceeded(Exception):
+    pass
+
+
 def _git_error(code: ErrorCode, message: str, remediation: str) -> WeaverError:
     return WeaverError(code, message, remediation)
+
+
+def _run_bounded_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    input_data: bytes | None,
+    max_bytes: int,
+) -> subprocess.CompletedProcess[bytes]:
+    """Drain both pipes concurrently and stop the child as soon as either cap is exceeded."""
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        shell=False,
+        stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    stdout = bytearray()
+    stderr = bytearray()
+    overflow = threading.Event()
+    reader_errors: list[OSError] = []
+
+    def drain(stream: BinaryIO, destination: bytearray) -> None:
+        try:
+            while chunk := stream.read(64 * 1024):
+                remaining = max_bytes - len(destination)
+                if len(chunk) > remaining:
+                    destination.extend(chunk[: max(0, remaining)])
+                    overflow.set()
+                    process.kill()
+                    return
+                destination.extend(chunk)
+        except OSError as exc:
+            reader_errors.append(exc)
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    readers = [
+        threading.Thread(target=drain, args=(process.stdout, stdout), daemon=True),
+        threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True),
+    ]
+    for thread in readers:
+        thread.start()
+
+    writer: threading.Thread | None = None
+    if input_data is not None:
+        assert process.stdin is not None
+        process_stdin = process.stdin
+
+        def write_input() -> None:
+            try:
+                process_stdin.write(input_data)
+                process_stdin.close()
+            except BrokenPipeError:
+                pass
+            except OSError as exc:
+                reader_errors.append(exc)
+
+        writer = threading.Thread(target=write_input, daemon=True)
+        writer.start()
+
+    deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+    try:
+        while process.poll() is None:
+            if overflow.is_set():
+                process.kill()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                raise subprocess.TimeoutExpired(command, GIT_TIMEOUT_SECONDS)
+            try:
+                process.wait(timeout=min(0.05, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        for thread in readers:
+            thread.join(timeout=1)
+        if writer is not None:
+            writer.join(timeout=1)
+    if overflow.is_set():
+        raise _OutputLimitExceeded
+    if reader_errors:
+        raise reader_errors[0]
+    return subprocess.CompletedProcess(command, process.returncode, bytes(stdout), bytes(stderr))
 
 
 class GitRepository:
@@ -115,6 +224,26 @@ class GitRepository:
             )
         return cls(root, git)
 
+    @overload
+    def run(
+        self,
+        arguments: list[str],
+        *,
+        max_bytes: int = MAX_GIT_OUTPUT_BYTES,
+        binary: Literal[False] = False,
+        input_data: bytes | None = None,
+    ) -> str: ...
+
+    @overload
+    def run(
+        self,
+        arguments: list[str],
+        *,
+        max_bytes: int = MAX_GIT_OUTPUT_BYTES,
+        binary: Literal[True],
+        input_data: bytes | None = None,
+    ) -> bytes: ...
+
     def run(
         self,
         arguments: list[str],
@@ -143,32 +272,26 @@ class GitRepository:
                 "Git input exceeded the bounded collection limit.",
                 "Narrow the include patterns or split the change.",
             )
-        input_arguments = (
-            {"stdin": subprocess.DEVNULL} if input_data is None else {"input": input_data}
-        )
         try:
-            completed = subprocess.run(
+            completed = _run_bounded_process(
                 command,
                 cwd=self.root,
                 env=env,
-                shell=False,
-                capture_output=True,
-                timeout=GIT_TIMEOUT_SECONDS,
-                check=False,
-                **input_arguments,
+                input_data=input_data,
+                max_bytes=min(max_bytes, HARD_MAX_GIT_OUTPUT_BYTES),
             )
+        except _OutputLimitExceeded as exc:
+            raise _git_error(
+                ErrorCode.DIFF_TOO_LARGE,
+                "Git output exceeded the bounded collection limit.",
+                "Narrow the include patterns or split the change.",
+            ) from exc
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise _git_error(
                 ErrorCode.NOT_A_GIT_REPOSITORY,
                 "Git did not complete safely within the configured timeout.",
                 "Verify the repository and Git installation, then retry with a smaller scope.",
             ) from exc
-        if len(completed.stdout) > max_bytes or len(completed.stderr) > max_bytes:
-            raise _git_error(
-                ErrorCode.DIFF_TOO_LARGE,
-                "Git output exceeded the bounded collection limit.",
-                "Narrow the include patterns or split the change.",
-            )
         if completed.returncode != 0:
             raise _git_error(
                 ErrorCode.INVALID_REF,
@@ -227,10 +350,15 @@ class GitRepository:
             size = int(size_text.strip())
         except (ValueError, WeaverError):
             return None
-        if size > max_bytes:
+        effective_max_bytes = min(max_bytes, MAX_SOURCE_FILE_BYTES)
+        if size > effective_max_bytes:
             return None
         try:
-            raw = self.run(["show", f"{commit}:{normalized}"], max_bytes=max_bytes, binary=True)
+            raw = self.run(
+                ["show", f"{commit}:{normalized}"],
+                max_bytes=effective_max_bytes,
+                binary=True,
+            )
         except WeaverError:
             return None
         if b"\x00" in raw:
@@ -271,43 +399,62 @@ class GitRepository:
         normalized_paths = sorted({normalize_repo_path(path) for path in paths})
         if not normalized_paths:
             return {}
-        raw = self.run(
-            [
-                "ls-tree",
-                "-z",
-                commit,
-                "--",
-                *(f":(literal){path}" for path in normalized_paths),
-            ],
-            binary=True,
-        )
         requested = set(normalized_paths)
         entries: dict[str, GitTreeEntry] = {}
-        for record in raw.split(b"\x00"):
-            if not record or b"\t" not in record:
-                continue
-            header, path_raw = record.split(b"\t", 1)
-            parts = header.split(b" ", 2)
-            if len(parts) != 3:
-                continue
-            try:
-                mode = parts[0].decode("ascii", errors="strict")
-                object_id = parts[2].decode("ascii", errors="strict")
-                path = normalize_repo_path(path_raw.decode("utf-8", errors="strict"))
-            except (UnicodeDecodeError, WeaverError):
-                continue
-            if path in requested and COMMIT_RE.fullmatch(object_id):
-                entries[path] = GitTreeEntry(mode=mode, object_id=object_id)
+        for start in range(0, len(normalized_paths), MAX_TREE_PATHS_PER_COMMAND):
+            chunk = normalized_paths[start : start + MAX_TREE_PATHS_PER_COMMAND]
+            raw = self.run(
+                [
+                    "ls-tree",
+                    "-z",
+                    commit,
+                    "--",
+                    *(f":(literal){path}" for path in chunk),
+                ],
+                binary=True,
+            )
+            for record in raw.split(b"\x00"):
+                if not record or b"\t" not in record:
+                    continue
+                header, path_raw = record.split(b"\t", 1)
+                parts = header.split(b" ", 2)
+                if len(parts) != 3:
+                    continue
+                try:
+                    mode = parts[0].decode("ascii", errors="strict")
+                    object_id = parts[2].decode("ascii", errors="strict")
+                    path = normalize_repo_path(path_raw.decode("utf-8", errors="strict"))
+                except (UnicodeDecodeError, WeaverError):
+                    continue
+                if path in requested and COMMIT_RE.fullmatch(object_id):
+                    entries[path] = GitTreeEntry(mode=mode, object_id=object_id)
         return entries
 
-    def read_blob_objects(self, object_ids: set[str], max_bytes: int) -> dict[str, str | None]:
+    def read_blob_objects(
+        self,
+        object_ids: set[str],
+        max_bytes: int,
+        *,
+        max_total_bytes: int = MAX_SOURCE_BLOB_BYTES,
+    ) -> dict[str, str | None]:
         """Read many bounded blob objects with batch plumbing instead of per-file processes."""
+        return self._read_blob_objects(object_ids, max_bytes, max_total_bytes=max_total_bytes).texts
+
+    def _read_blob_objects(
+        self,
+        object_ids: set[str],
+        max_bytes: int,
+        *,
+        max_total_bytes: int = MAX_SOURCE_BLOB_BYTES,
+    ) -> _BlobBatch:
+        """Return bounded blob text plus non-sensitive failure classes for scope reporting."""
         requested = sorted(object_ids)
         if any(not COMMIT_RE.fullmatch(object_id) for object_id in requested):
             raise _git_error(ErrorCode.INVALID_REF, "An invalid object ID was rejected.", "Retry.")
         result: dict[str, str | None] = dict.fromkeys(requested)
+        failures = dict.fromkeys(requested, "missing_or_not_blob")
         if not requested:
-            return result
+            return _BlobBatch(result, failures)
         batch_input = b"".join(f"{object_id}\n".encode("ascii") for object_id in requested)
         try:
             raw_info = self.run(
@@ -317,8 +464,10 @@ class GitRepository:
                 input_data=batch_input,
             )
         except WeaverError:
-            return result
+            return _BlobBatch(result, failures)
         eligible: list[tuple[str, int]] = []
+        aggregate_bytes = 0
+        effective_max_bytes = min(max_bytes, MAX_SOURCE_FILE_BYTES)
         for line in raw_info.splitlines():
             parts = line.split(b" ")
             if len(parts) != 3 or parts[1] != b"blob":
@@ -328,10 +477,18 @@ class GitRepository:
                 size = int(parts[2])
             except (UnicodeDecodeError, ValueError):
                 continue
-            if object_id in result and 0 <= size <= max_bytes:
-                eligible.append((object_id, size))
+            if object_id not in result or size < 0:
+                continue
+            if size > effective_max_bytes:
+                failures[object_id] = "oversized"
+                continue
+            if aggregate_bytes + size > min(max_total_bytes, MAX_SOURCE_BLOB_BYTES):
+                failures[object_id] = "aggregate_source_limit"
+                continue
+            eligible.append((object_id, size))
+            aggregate_bytes += size
 
-        chunk_budget = max(MAX_GIT_OUTPUT_BYTES, max_bytes + 1024)
+        chunk_budget = MAX_GIT_OUTPUT_BYTES
         chunks: list[list[tuple[str, int]]] = []
         current: list[tuple[str, int]] = []
         current_bytes = 0
@@ -380,13 +537,18 @@ class GitRepository:
                     break
                 content = raw_blobs[content_start:content_end]
                 offset = content_end + 1
-                if object_id not in result or b"\x00" in content:
+                if object_id not in result:
+                    continue
+                if b"\x00" in content:
+                    failures[object_id] = "binary"
                     continue
                 try:
                     result[object_id] = content.decode("utf-8", errors="strict")
                 except UnicodeDecodeError:
+                    failures[object_id] = "non_utf8"
                     continue
-        return result
+                failures.pop(object_id, None)
+        return _BlobBatch(result, failures)
 
     def list_files(self, commit: str, max_bytes: int = MAX_GIT_OUTPUT_BYTES) -> list[str]:
         raw = self.run(
@@ -413,6 +575,8 @@ def _parse_name_status(raw: bytes) -> list[ChangedFile]:
         status = fields[index].decode("ascii", errors="strict")
         index += 1
         code = status[:1]
+        old_path: str | None
+        new_path: str | None
         if code in {"R", "C"}:
             old_path = normalize_repo_path(fields[index].decode("utf-8", errors="strict"))
             new_path = normalize_repo_path(fields[index + 1].decode("utf-8", errors="strict"))
@@ -461,6 +625,7 @@ def _hunks(repo: GitRepository, base: str, head: str, path: str) -> list[Hunk]:
             "--no-ext-diff",
             "--no-textconv",
             "--no-color",
+            "--text",
             "--unified=0",
             base,
             head,
@@ -498,8 +663,9 @@ def _resource_selection(
     changed_lines: int,
     config: WeaverConfig,
 ) -> tuple[set[str] | None, dict[str, int], list[str]]:
-    """Prioritize bounded critical-path scope when global metadata exceeds defaults."""
-    files_exceeded = len(files) > config.rules.max_changed_files
+    """Prioritize bounded critical-path scope after mandatory and user filtering."""
+    file_limit = min(config.rules.max_changed_files, MAX_ANALYZED_FILES)
+    files_exceeded = len(files) > file_limit
     lines_exceeded = changed_lines > config.rules.max_diff_lines
     if not files_exceeded and not lines_exceeded:
         return None, {}, []
@@ -508,7 +674,7 @@ def _resource_selection(
             raise _git_error(
                 ErrorCode.DIFF_TOO_LARGE,
                 f"The diff contains {len(files)} changed files; the configured limit is "
-                f"{config.rules.max_changed_files}.",
+                f"{file_limit}.",
                 "Narrow the include patterns, split the change, or increase "
                 "rules.max_changed_files.",
             )
@@ -518,15 +684,8 @@ def _resource_selection(
             f"{config.rules.max_diff_lines}.",
             "Narrow the include patterns, split the change, or increase rules.max_diff_lines.",
         )
-    eligible = [
-        item
-        for item in files
-        if item.path.endswith(".py")
-        and not any(exclusion_reason(path) for path in (item.old_path, item.new_path) if path)
-        and is_included(item.path, config.paths.include, config.paths.exclude)
-    ]
     ranked = sorted(
-        eligible,
+        files,
         key=lambda item: (
             -_critical_weight(item.path, config),
             -sum(stats.get(item.path, (0, 0, False))[:2]),
@@ -542,7 +701,7 @@ def _resource_selection(
     selected: set[str] = set()
     selected_lines = 0
     for changed in ranked:
-        if len(selected) >= config.rules.max_changed_files:
+        if len(selected) >= file_limit:
             break
         additions, deletions, _ = stats.get(changed.path, (0, 0, False))
         file_lines = additions + deletions
@@ -562,7 +721,7 @@ def _resource_selection(
             "The diff exceeds configured limits and no file fits the bounded analysis scope.",
             "Narrow the include patterns or split the change.",
         )
-    omitted = max(0, len(eligible) - len(selected))
+    omitted = max(0, len(files) - len(selected))
     omitted_counts = {"resource_prioritization": omitted} if omitted else {}
     warnings = [
         "The diff exceeded global resource limits; analyzed prioritized critical-path scope only."
@@ -597,6 +756,7 @@ def collect_diff(
             "diff",
             "--no-ext-diff",
             "--no-textconv",
+            "--text",
             "--numstat",
             "-z",
             *RENAME_DETECTION_ARGUMENTS,
@@ -607,13 +767,10 @@ def collect_diff(
         binary=True,
     )
     stats, changed_lines = _parse_numstat(numstat_raw)
-    selected_scope, omitted_counts, resource_warnings = _resource_selection(
-        files, stats, changed_lines, config
-    )
     excluded: Counter[str] = Counter()
     candidates: list[ChangedFile] = []
     selected: list[ChangedFile] = []
-    warnings: list[str] = list(resource_warnings)
+    warnings: list[str] = []
     for changed in files:
         path = changed.path
         reason = next(
@@ -634,20 +791,23 @@ def collect_diff(
         if not path.endswith(".py"):
             excluded["unsupported_extension"] += 1
             continue
-        if selected_scope is not None and path not in selected_scope:
-            excluded["resource_prioritization"] += 1
-            continue
         additions, deletions, binary = stats.get(path, (0, 0, False))
         changed.additions = additions
         changed.deletions = deletions
         changed.binary = binary
-        if binary:
-            excluded["binary"] += 1
-            continue
         candidates.append(changed)
 
+    eligible_changed_lines = sum(item.additions + item.deletions for item in candidates)
+    selected_scope, omitted_counts, resource_warnings = _resource_selection(
+        candidates, stats, eligible_changed_lines, config
+    )
+    warnings.extend(resource_warnings)
+    if selected_scope is not None:
+        candidates = [item for item in candidates if item.path in selected_scope]
+
     base_entries = repo.tree_entries(
-        base_commit, [item.old_path for item in candidates if item.old_path]
+        base_commit,
+        [item.old_path for item in candidates if item.old_path and not item.status.startswith("C")],
     )
     head_entries = repo.tree_entries(
         head_commit, [item.new_path for item in candidates if item.new_path]
@@ -658,24 +818,51 @@ def collect_diff(
         for entry in entries.values()
         if entry.mode not in {"120000", "160000"}
     }
-    blob_text = repo.read_blob_objects(object_ids, config.rules.max_file_bytes)
+    blob_batch = repo._read_blob_objects(object_ids, config.rules.max_file_bytes)
+    source_truncated = False
 
     for changed in candidates:
-        old_entry = base_entries.get(changed.old_path) if changed.old_path else None
+        is_copy = changed.status.startswith("C")
+        old_entry = base_entries.get(changed.old_path) if changed.old_path and not is_copy else None
         new_entry = head_entries.get(changed.new_path) if changed.new_path else None
         modes = {entry.mode for entry in (old_entry, new_entry) if entry is not None}
         if modes & {"120000", "160000"}:
             excluded["symlink_or_gitlink"] += 1
             continue
-        changed.old_text = blob_text.get(old_entry.object_id) if old_entry else None
-        changed.new_text = blob_text.get(new_entry.object_id) if new_entry else None
-        if (changed.old_path and changed.old_text is None) or (
+        changed.old_text = blob_batch.texts.get(old_entry.object_id) if old_entry else None
+        changed.new_text = blob_batch.texts.get(new_entry.object_id) if new_entry else None
+        if (changed.old_path and not is_copy and changed.old_text is None) or (
             changed.new_path and changed.new_text is None
         ):
-            excluded["oversized_or_non_utf8"] += 1
+            failure_classes = {
+                blob_batch.failures.get(entry.object_id, "missing_or_not_blob")
+                for entry in (old_entry, new_entry)
+                if entry is not None and blob_batch.texts.get(entry.object_id) is None
+            }
+            if "binary" in failure_classes:
+                excluded["binary"] += 1
+            elif "aggregate_source_limit" in failure_classes:
+                excluded["aggregate_source_limit"] += 1
+                omitted_counts["aggregate_source_limit"] = (
+                    omitted_counts.get("aggregate_source_limit", 0) + 1
+                )
+                source_truncated = True
+            else:
+                excluded["oversized_or_non_utf8"] += 1
             warnings.append(f"Skipped bounded source parsing for {changed.path!r}.")
             continue
-        changed.hunks = _hunks(repo, base_commit, head_commit, changed.path)
+        if is_copy:
+            changed.hunks = [
+                Hunk(
+                    id="hunk-001",
+                    old_start=0,
+                    old_count=0,
+                    new_start=1,
+                    new_count=max(1, len((changed.new_text or "").splitlines())),
+                )
+            ]
+        else:
+            changed.hunks = _hunks(repo, base_commit, head_commit, changed.path)
         selected.append(changed)
     return DiffCollection(
         files=selected,
@@ -684,5 +871,5 @@ def collect_diff(
         excluded_counts=dict(sorted(excluded.items())),
         warnings=warnings,
         omitted_counts=omitted_counts,
-        truncated=selected_scope is not None,
+        truncated=selected_scope is not None or source_truncated,
     )

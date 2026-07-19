@@ -5,8 +5,9 @@ from typing import Any
 
 import pytest
 
+import hermes_semantic_diff_weaver.service as service
 from hermes_semantic_diff_weaver.plugin import handle_analyze_semantic_diff
-from hermes_semantic_diff_weaver.service import analyze
+from hermes_semantic_diff_weaver.service import _read_readme_excerpt, analyze
 
 
 @pytest.mark.parametrize("output_format", ["json", "markdown", "both"])
@@ -42,6 +43,48 @@ def test_no_python_change_is_successful_empty_analysis(repo_factory) -> None:
     assert result["success"] is True
     assert result["behavior_changes"] == []
     assert any("no included changed Python" in item for item in result["limitations"])
+
+
+def test_empty_analysis_does_not_build_a_test_index(repo_factory, monkeypatch) -> None:
+    repo, base, head = repo_factory({"README.md": "old\n"}, {"README.md": "new\n"})
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("test indexing should be lazy")
+
+    monkeypatch.setattr(service, "build_test_index", unexpected)
+    result = analyze(
+        {"repo_path": str(repo), "base_ref": base, "head_ref": head, "output_format": "json"}
+    )
+    assert result["behavior_changes"] == []
+
+
+def test_readme_context_uses_only_an_allowed_repository_root_file() -> None:
+    class FakeRepository:
+        def list_files(self, commit: str) -> list[str]:
+            return ["docs/README.md", "README.md"]
+
+        def read_blob(self, commit: str, path: str, max_bytes: int) -> str:
+            return path
+
+    assert _read_readme_excerpt(FakeRepository(), "a" * 40, service.WeaverConfig()) == "README.md"
+
+    class BoundedRepository:
+        def list_files(self, commit: str) -> list[str]:
+            raise service.WeaverError(service.ErrorCode.DIFF_TOO_LARGE, "safe", "narrow")
+
+    assert _read_readme_excerpt(BoundedRepository(), "a" * 40, service.WeaverConfig()) is None
+
+    no_readme = FakeRepository()
+    no_readme.list_files = lambda commit: ["docs/README.md"]
+    assert _read_readme_excerpt(no_readme, "a" * 40, service.WeaverConfig()) is None
+
+    unreadable = FakeRepository()
+    unreadable.read_blob = lambda commit, path, max_bytes: None
+    assert _read_readme_excerpt(unreadable, "a" * 40, service.WeaverConfig()) is None
+
+    disabled = service.WeaverConfig()
+    disabled.rules.max_readme_chars = 0
+    assert _read_readme_excerpt(FakeRepository(), "a" * 40, disabled) is None
 
 
 def test_empty_python_file_change_is_a_successful_empty_analysis(repo_factory) -> None:
@@ -147,6 +190,24 @@ def test_minimum_confidence_and_refactor_policies_are_visible(repo_factory) -> N
     )
     assert result["behavior_changes"] == []
     assert any(item["reason"] == "minimum_confidence" for item in result["scope"]["omitted"])
+
+
+def test_uninspectable_included_source_is_truncated_with_zero_empty_confidence(
+    repo_factory,
+) -> None:
+    config = "version: 1\nrules:\n  max_file_bytes: 1024\n"
+    old = "value = '" + "x" * 2000 + "'\n"
+    new = "value = '" + "y" * 2000 + "'\n"
+    repo, base, head = repo_factory(
+        {"large.py": old, ".semantic-diff-weaver.yaml": config},
+        {"large.py": new, ".semantic-diff-weaver.yaml": config},
+    )
+    result = analyze(
+        {"repo_path": str(repo), "base_ref": base, "head_ref": head, "output_format": "json"}
+    )
+    assert result["behavior_changes"] == []
+    assert result["scope"]["truncated"] is True
+    assert result["summary"]["overall_confidence"] == 0.0
 
 
 def test_every_high_risk_behavior_keeps_a_linked_obligation(repo_factory) -> None:

@@ -104,6 +104,7 @@ python -m pytest --cov=hermes_semantic_diff_weaver --cov-branch --cov-report=jso
 python scripts/check_coverage.py coverage.json
 python -m ruff check .
 python -m ruff format --check .
+python -m mypy
 python -m build
 python scripts/verify_wheel.py dist
 python scripts/verify_hermes.py  # with Hermes >=0.14.0 and the wheel installed

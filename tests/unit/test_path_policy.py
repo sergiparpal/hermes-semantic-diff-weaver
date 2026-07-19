@@ -31,6 +31,15 @@ def test_paths_normalize_and_globs_match_root() -> None:
     assert glob_matches("src/api.py", "**/*.py")
 
 
+def test_globs_preserve_hidden_segments_and_do_not_cross_directories() -> None:
+    assert glob_matches(".hidden.py", ".hidden.py")
+    assert glob_matches(".github/workflows/check.py", ".github/**/*.py")
+    assert glob_matches("src/api.py", "src/*.py")
+    assert not glob_matches("src/nested/api.py", "src/*.py")
+    assert glob_matches("src/nested/api.py", "src/**/*.py")
+    assert glob_matches("/".join(["segment"] * 1500) + "/api.py", "**/*.py")
+
+
 @pytest.mark.parametrize(
     ("path", "reason"),
     [

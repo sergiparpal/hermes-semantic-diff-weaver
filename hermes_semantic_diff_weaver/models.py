@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .errors import ErrorCode
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION: Literal["1.0"] = "1.0"
 
 
 class StrictModel(BaseModel):
@@ -308,6 +308,32 @@ class AnalysisResult(StrictModel):
 
     @model_validator(mode="after")
     def references_resolve(self) -> AnalysisResult:
+        if self.summary.changed_files != self.scope.changed_files_total:
+            raise ValueError("summary and scope changed-file counts must agree")
+        if self.summary.changed_symbols != self.scope.changed_symbols:
+            raise ValueError("summary and scope changed-symbol counts must agree")
+        if self.summary.behavior_changes != len(self.behavior_changes):
+            raise ValueError("summary behavior count must match behavior_changes")
+        if self.summary.test_obligations != len(self.test_obligations):
+            raise ValueError("summary obligation count must match test_obligations")
+        if len(set(self.scope.analyzed_files)) != len(self.scope.analyzed_files):
+            raise ValueError("analyzed file paths must be unique")
+        expected_risk_counts = {
+            label: sum(item.risk is label for item in self.behavior_changes) for label in RiskLabel
+        }
+        if self.summary.risk_counts != expected_risk_counts:
+            raise ValueError("summary risk counts must match behavior_changes")
+        if self.behavior_changes:
+            highest_score = max(item.risk_score for item in self.behavior_changes)
+            highest_risks = {
+                item.risk for item in self.behavior_changes if item.risk_score == highest_score
+            }
+            if self.summary.risk_score != highest_score:
+                raise ValueError("summary risk score must equal the highest behavior score")
+            if self.summary.overall_risk not in highest_risks:
+                raise ValueError("summary risk label must come from a highest-scoring behavior")
+        elif self.summary.risk_score or self.summary.overall_risk is not RiskLabel.LOW:
+            raise ValueError("an empty analysis must have zero low risk")
         behavior_ids = {item.id for item in self.behavior_changes}
         if len(behavior_ids) != len(self.behavior_changes):
             raise ValueError("behavior change IDs must be unique")

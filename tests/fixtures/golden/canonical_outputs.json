@@ -1538,9 +1538,7 @@
       "changed_files_total": 2,
       "changed_lines": 4,
       "changed_symbols": 1,
-      "excluded_counts": {
-        "resource_prioritization": 1
-      },
+      "excluded_counts": {},
       "omitted": [
         {
           "count": 1,

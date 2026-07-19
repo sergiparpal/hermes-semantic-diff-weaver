@@ -350,6 +350,7 @@ def interpret_candidates(
     successes = 0
     usage: LlmUsage | None = None
     schema_failure_seen = False
+    visited_batches = 0
     bounded_readme = (
         redact_text(readme_excerpt, max_chars=config.rules.max_readme_chars)
         if readme_excerpt and config.rules.max_readme_chars
@@ -358,6 +359,7 @@ def interpret_candidates(
     for batch_index, batch in enumerate(batches):
         if calls >= config.rules.max_llm_calls:
             break
+        visited_batches += 1
         context = bounded_readme if batch_index == 0 else None
         payload = _batch_payload(batch.payload_items, context)
         while context and len(_input_text(payload)) > config.rules.max_model_input_chars_per_call:
@@ -473,8 +475,8 @@ def interpret_candidates(
             if suggestion.behavior_index >= len(accepted_for_batch):
                 warnings.append("Discarded an LLM obligation with an invalid behavior index.")
                 continue
-            accepted = accepted_for_batch[suggestion.behavior_index]
-            if accepted is None:
+            suggested_candidate = accepted_for_batch[suggestion.behavior_index]
+            if suggested_candidate is None:
                 continue
             if suggestion_counts[suggestion.behavior_index] >= 6:
                 warnings.append("Discarded an LLM obligation above the per-behavior cap.")
@@ -482,7 +484,7 @@ def interpret_candidates(
             suggestion_counts[suggestion.behavior_index] += 1
             suggestions.append(
                 SuggestedScenario(
-                    evidence_ids=tuple(item.id for item in accepted.evidence),
+                    evidence_ids=tuple(item.id for item in suggested_candidate.evidence),
                     type=suggestion.type,
                     title=suggestion.title,
                     given=suggestion.given,
@@ -490,6 +492,13 @@ def interpret_candidates(
                     then=suggestion.then,
                 )
             )
+    runtime_omitted = len(batches) - visited_batches
+    if runtime_omitted:
+        omitted_batches += runtime_omitted
+        warnings.append(
+            f"Omitted {runtime_omitted} LLM evidence batch(es) after retries exhausted the "
+            "call budget."
+        )
     available = successes > 0
     if not config.rules.deterministic_fallback and not available:
         code = ErrorCode.LLM_SCHEMA_FAILURE if schema_failure_seen else ErrorCode.LLM_UNAVAILABLE

@@ -74,3 +74,16 @@ def test_partial_parse_failure_preserves_other_file() -> None:
     assert analysis.failed_files == 1
     assert analysis.deltas
     assert analysis.warnings
+
+
+def test_copy_is_reported_as_added_surface_not_an_unchanged_rename() -> None:
+    copied = ChangedFile(
+        status="C100",
+        old_path="src/original.py",
+        new_path="src/copied.py",
+        hunks=[Hunk(id="hunk-001", old_start=0, old_count=0, new_start=1, new_count=2)],
+        old_text="def copied():\n    return 1\n",
+        new_text="def copied():\n    return 1\n",
+    )
+    deltas = analyze_ast([copied]).deltas
+    assert any(item.kind == "symbol_added" and item.symbol == "copied" for item in deltas)

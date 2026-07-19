@@ -50,3 +50,23 @@ def test_per_symbol_behavior_cap_is_enforced() -> None:
     payload["behaviors"] = payload["behaviors"] * 4
     result = interpret_candidates([candidate()], FakeLlm([Result("json", payload)]), WeaverConfig())
     assert any("per-symbol behavior cap" in item for item in result.warnings)
+
+
+def test_duplicate_evidence_and_its_obligation_are_discarded_together() -> None:
+    payload = valid_payload()
+    payload["behaviors"][0]["evidence_ids"] = ["ev-001", "ev-001"]
+    result = interpret_candidates([candidate()], FakeLlm([Result("json", payload)]), WeaverConfig())
+    assert any("duplicate evidence" in item for item in result.warnings)
+    assert result.suggestions == []
+
+
+def test_invalid_and_excess_per_behavior_obligations_are_discarded() -> None:
+    payload = valid_payload()
+    payload["obligations"] = payload["obligations"] * 7
+    invalid = dict(payload["obligations"][0])
+    invalid["behavior_index"] = 99
+    payload["obligations"].append(invalid)
+    result = interpret_candidates([candidate()], FakeLlm([Result("json", payload)]), WeaverConfig())
+    assert len(result.suggestions) == 6
+    assert any("per-behavior cap" in item for item in result.warnings)
+    assert any("invalid behavior index" in item for item in result.warnings)

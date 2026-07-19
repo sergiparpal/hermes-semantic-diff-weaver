@@ -28,12 +28,12 @@ from .models import (
     WeaverConfig,
 )
 from .obligations import generate_obligations
-from .path_policy import glob_matches, redact_text
+from .path_policy import exclusion_reason, glob_matches, redact_text
 from .renderer import render_transport
 from .scoring import confidence_score, score_risk
 from .semantic_candidates import SemanticCandidate, build_candidates
 from .semantic_interpreter import interpret_candidates
-from .test_mapper import build_test_index, map_candidate_tests
+from .test_mapper import TestIndex, build_test_index, map_candidate_tests
 
 
 def _validation_error(exc: ValidationError) -> WeaverError:
@@ -82,10 +82,17 @@ def _prioritize_deltas(
 def _read_readme_excerpt(repo: GitRepository, head_commit: str, config: WeaverConfig) -> str | None:
     if config.rules.max_readme_chars == 0:
         return None
+    try:
+        repository_files = repo.list_files(head_commit)
+    except WeaverError:
+        return None
     readme = next(
         (
             path
-            for path in repo.list_files(head_commit)
+            for path in repository_files
+            if "/" not in path
+            and not exclusion_reason(path)
+            and not any(glob_matches(path, pattern) for pattern in config.paths.exclude)
             if path.rsplit("/", 1)[-1].casefold()
             in {"readme", "readme.md", "readme.rst", "readme.txt"}
         ),
@@ -157,13 +164,22 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
     config, config_warnings = load_config(repo.root, request)
     collection = collect_diff(repo, base_commit, head_commit, config)
     ast_result = analyze_ast(collection.files)
+    incomplete_exclusions = sum(
+        collection.excluded_counts.get(reason, 0)
+        for reason in (
+            "aggregate_source_limit",
+            "binary",
+            "oversized_or_non_utf8",
+            "symlink_or_gitlink",
+        )
+    )
     omitted = [
         OmittedScope(reason=reason, count=count)
         for reason, count in sorted(collection.omitted_counts.items())
         if count
     ]
-    scope_truncated = collection.truncated
-    confidence_truncated = collection.truncated
+    scope_truncated = collection.truncated or bool(incomplete_exclusions)
+    confidence_truncated = collection.truncated or bool(incomplete_exclusions)
     if ast_result.failed_files:
         omitted.append(OmittedScope(reason="parse_incomplete_files", count=ast_result.failed_files))
         scope_truncated = True
@@ -176,11 +192,16 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
         scope_truncated = True
         confidence_truncated = True
     deterministic = build_candidates(deltas, config)
+    readme_excerpt = (
+        _read_readme_excerpt(repo, head_commit, config)
+        if deterministic and llm is not None and config.rules.max_llm_calls
+        else None
+    )
     interpreted = interpret_candidates(
         deterministic,
         llm,
         config,
-        readme_excerpt=_read_readme_excerpt(repo, head_commit, config),
+        readme_excerpt=readme_excerpt,
     )
     if interpreted.omitted_batches:
         omitted.append(OmittedScope(reason="llm_batch_limit", count=interpreted.omitted_batches))
@@ -226,12 +247,17 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
         omitted.append(OmittedScope(reason="minimum_confidence", count=low_confidence_omitted))
     if refactors_omitted:
         omitted.append(OmittedScope(reason="low_risk_refactor_policy", count=refactors_omitted))
-    test_index = build_test_index(repo, head_commit, config)
+    test_index = (
+        build_test_index(repo, head_commit, config)
+        if reportable and config.rules.max_candidate_tests_per_obligation
+        else TestIndex(tests=[], incomplete=False, warnings=[])
+    )
     warnings.extend(test_index.warnings)
     mapped_by_index = map_candidate_tests(reportable, test_index, config)
     behaviors: list[BehaviorChange] = []
     tests_by_behavior: dict[str, list[Any]] = {}
     fallback_mode = not interpreted.status.available
+    partial_fallback = bool(interpreted.status.failures or interpreted.omitted_batches)
     for index, candidate in enumerate(reportable, start=1):
         candidate_tests = mapped_by_index.get(index - 1, [])
         risk_score, risk, explanation = score_risk(candidate, candidate_tests, config)
@@ -243,7 +269,7 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
             else Presentation.FINDING
         )
         origin = candidate.origin
-        if fallback_mode and origin is Origin.DETERMINISTIC:
+        if (fallback_mode or partial_fallback) and origin is Origin.DETERMINISTIC:
             origin = Origin.DETERMINISTIC_FALLBACK
         behavior = BehaviorChange(
             id=f"bc-{index:03d}",
@@ -291,7 +317,7 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
     else:
         overall_risk = RiskLabel.LOW
         overall_score = 0
-        overall_confidence = 1.0
+        overall_confidence = 0.0 if scope_truncated or ast_result.failed_files else 1.0
     risk_counts = {label: 0 for label in RiskLabel}
     for behavior in behaviors:
         risk_counts[behavior.risk] += 1
@@ -314,6 +340,11 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
         limitations.append(
             f"{ast_result.failed_files} changed Python file(s) had incomplete parser context."
         )
+    if incomplete_exclusions:
+        limitations.append(
+            f"{incomplete_exclusions} included Python file(s) could not be inspected within "
+            "the immutable source-safety bounds."
+        )
     if collection.truncated:
         limitations.append(
             "Only prioritized critical-path scope was analyzed due to resource limits."
@@ -322,6 +353,11 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
         limitations.append("Some optional model interpretation context was omitted or truncated.")
     if fallback_mode and deterministic:
         limitations.append("LLM interpretation was unavailable; deterministic fallback was used.")
+    elif partial_fallback:
+        limitations.append(
+            "LLM interpretation was partial; deterministic fallback was retained for uncovered "
+            "evidence."
+        )
     analysis = AnalysisResult(
         analysis_id=f"sdw_{uuid4().hex}",
         repository=RepositoryIdentity(
@@ -354,6 +390,6 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
         warnings=sorted(set(warnings)),
         limitations=limitations,
         llm=interpreted.status if deterministic else LlmStatus(),
-        deterministic_mode=fallback_mode,
+        deterministic_mode=fallback_mode or partial_fallback,
     )
     return render_transport(analysis, request.output_format)

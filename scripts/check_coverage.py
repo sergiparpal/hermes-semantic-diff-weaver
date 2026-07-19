@@ -12,10 +12,14 @@ CRITICAL_MODULES = (
     "config.py",
     "errors.py",
     "git_diff.py",
+    "obligations.py",
     "path_policy.py",
     "plugin.py",
     "renderer.py",
     "scoring.py",
+    "semantic_interpreter.py",
+    "service.py",
+    "test_mapper.py",
 )
 
 

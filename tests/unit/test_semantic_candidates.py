@@ -98,3 +98,36 @@ def test_overlapping_deterministic_and_llm_candidates_merge_evidence() -> None:
     assert [item.id for item in merged[0].evidence] == ["ev-001", "ev-999"]
     assert merged[0].origin is Origin.LLM_SUPPORTED
     assert merged[0].summary == "The exact boundary is included."
+
+
+def test_semantically_equal_candidate_impacts_deduplicate_without_shared_evidence() -> None:
+    first = build_candidates([delta("comparison_change", "x < 1", "x <= 1")])[0]
+    second = SemanticCandidate(
+        category=first.category,
+        summary=first.summary,
+        observable_impact=f"  {first.observable_impact.upper()}  ",
+        evidence=[Evidence(id="ev-999", path=first.path, symbol=first.symbol, kind="condition")],
+        confidence_baseline=first.confidence_baseline,
+    )
+    merged = _deduplicate_candidates([first, second])
+    assert len(merged) == 1
+    assert {item.id for item in merged[0].evidence} == {"ev-001", "ev-999"}
+
+
+def test_name_signals_match_tokens_instead_of_arbitrary_substrings() -> None:
+    assert (
+        build_candidates([delta("call_change", None, "client.write_text(value)")])[0].category
+        is BehaviorCategory.SIDE_EFFECT
+    )
+    assert (
+        build_candidates([delta("call_change", None, "authorize_user(value)")])[0].category
+        is BehaviorCategory.AUTHORIZATION
+    )
+    assert (
+        build_candidates([delta("call_change", None, "rewrite_cache(value)")])[0].category
+        is BehaviorCategory.DEPENDENCY_INTERACTION
+    )
+    assert (
+        build_candidates([delta("call_change", None, "dispatcher(value)")])[0].category
+        is BehaviorCategory.DEPENDENCY_INTERACTION
+    )

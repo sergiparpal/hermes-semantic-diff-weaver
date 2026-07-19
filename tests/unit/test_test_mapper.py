@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hermes_semantic_diff_weaver.test_mapper as test_mapper
 from hermes_semantic_diff_weaver.ast_diff import StructuralDelta
+from hermes_semantic_diff_weaver.errors import ErrorCode, WeaverError
+from hermes_semantic_diff_weaver.git_diff import GitTreeEntry
 from hermes_semantic_diff_weaver.models import LineRange, WeaverConfig
 from hermes_semantic_diff_weaver.semantic_candidates import build_candidates
 from hermes_semantic_diff_weaver.test_mapper import (
     IndexedTest,
     TestIndex,
+    _index_source,
     build_test_index,
     map_candidate_tests,
 )
@@ -72,8 +75,24 @@ def test_test_index_has_aggregate_file_and_byte_caps(monkeypatch) -> None:
         def list_files(self, commit: str) -> list[str]:
             return ["tests/test_a.py", "tests/test_b.py"]
 
-        def read_blob(self, commit: str, path: str, max_bytes: int) -> str:
-            return "def test_value():\n    assert True\n"
+        def tree_entries(self, commit: str, paths: list[str]):
+            return {
+                path: GitTreeEntry(mode="100644", object_id=f"{index + 1:040x}")
+                for index, path in enumerate(paths)
+            }
+
+        def read_blob_objects(
+            self,
+            object_ids: set[str],
+            max_bytes: int,
+            *,
+            max_total_bytes: int,
+        ) -> dict[str, str | None]:
+            source = "def test_value():\n    assert True\n"
+            return {
+                object_id: source if len(source.encode()) <= max_total_bytes else None
+                for object_id in object_ids
+            }
 
     monkeypatch.setattr(test_mapper, "MAX_TEST_INDEX_FILES", 1)
     index = build_test_index(FakeRepository(), "a" * 40, WeaverConfig())
@@ -86,4 +105,56 @@ def test_test_index_has_aggregate_file_and_byte_caps(monkeypatch) -> None:
     byte_limited = build_test_index(FakeRepository(), "a" * 40, WeaverConfig())
     assert byte_limited.incomplete is True
     assert byte_limited.tests == []
-    assert any("byte cap" in warning for warning in byte_limited.warnings)
+    assert any("bounded source limits" in warning for warning in byte_limited.warnings)
+
+
+def test_test_index_batches_reads_and_honors_excludes() -> None:
+    class FakeRepository:
+        def __init__(self) -> None:
+            self.tree_calls = 0
+            self.blob_calls = 0
+
+        def list_files(self, commit: str) -> list[str]:
+            return ["tests/test_keep.py", "tests/generated/test_skip.py"]
+
+        def tree_entries(self, commit: str, paths: list[str]):
+            self.tree_calls += 1
+            return {path: GitTreeEntry(mode="100644", object_id="a" * 40) for path in paths}
+
+        def read_blob_objects(self, object_ids, max_bytes, *, max_total_bytes):
+            self.blob_calls += 1
+            return {"a" * 40: "def test_keep():\n    assert True\n"}
+
+    repository = FakeRepository()
+    config = WeaverConfig()
+    config.paths.exclude.append("tests/generated/**")
+    index = build_test_index(repository, "b" * 40, config)
+    assert [item.path for item in index.tests] == ["tests/test_keep.py"]
+    assert repository.tree_calls == 1
+    assert repository.blob_calls == 1
+
+
+def test_test_discovery_limit_degrades_to_incomplete_mapping() -> None:
+    class FakeRepository:
+        def list_files(self, commit: str) -> list[str]:
+            raise WeaverError(ErrorCode.DIFF_TOO_LARGE, "safe", "narrow")
+
+    index = build_test_index(FakeRepository(), "b" * 40, WeaverConfig())
+    assert index.incomplete is True
+    assert index.tests == []
+    assert any("safe Git boundary" in warning for warning in index.warnings)
+
+
+def test_index_source_handles_import_forms_classes_and_async_tests() -> None:
+    indexed = _index_source(
+        "tests/test_sample.py",
+        "import package\n"
+        "from . import helper\n"
+        "class TestSample:\n"
+        "    def helper(self):\n"
+        "        return None\n"
+        "    async def test_value(self):\n"
+        "        assert helper\n",
+    )
+    assert [item.symbol for item in indexed] == ["TestSample.test_value"]
+    assert indexed[0].imports == frozenset({"package", "helper"})

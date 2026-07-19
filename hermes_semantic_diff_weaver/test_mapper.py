@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import ClassVar
 
+from .errors import WeaverError
 from .git_diff import GitRepository
 from .models import BehaviorCategory, CandidateTest, WeaverConfig
 from .path_policy import exclusion_reason, glob_matches, redact_text
@@ -115,10 +116,20 @@ def build_test_index(repo: GitRepository, head_commit: str, config: WeaverConfig
     tests: list[IndexedTest] = []
     incomplete = False
     warnings: list[str] = []
+    try:
+        repository_files = repo.list_files(head_commit)
+    except WeaverError:
+        return TestIndex(
+            tests=[],
+            incomplete=True,
+            warnings=["Candidate test file discovery exceeded a safe Git boundary."],
+        )
     test_paths = sorted(
         path
-        for path in repo.list_files(head_commit)
-        if not exclusion_reason(path) and _is_test_path(path, config.paths.test_roots)
+        for path in repository_files
+        if not exclusion_reason(path)
+        and not any(glob_matches(path, pattern) for pattern in config.paths.exclude)
+        and _is_test_path(path, config.paths.test_roots)
     )
     if len(test_paths) > MAX_TEST_INDEX_FILES:
         incomplete = True
@@ -126,12 +137,25 @@ def build_test_index(repo: GitRepository, head_commit: str, config: WeaverConfig
             f"Candidate test indexing was capped at {MAX_TEST_INDEX_FILES} files; mapping is incomplete."
         )
         test_paths = test_paths[:MAX_TEST_INDEX_FILES]
+    entries = repo.tree_entries(head_commit, test_paths)
+    eligible_entries = {
+        path: entry for path, entry in entries.items() if entry.mode not in {"120000", "160000"}
+    }
+    blob_text = repo.read_blob_objects(
+        {entry.object_id for entry in eligible_entries.values()},
+        config.rules.max_file_bytes,
+        max_total_bytes=MAX_TEST_INDEX_BYTES,
+    )
     indexed_bytes = 0
     for path in test_paths:
-        source = repo.read_blob(head_commit, path, config.rules.max_file_bytes)
+        entry = eligible_entries.get(path)
+        source = blob_text.get(entry.object_id) if entry else None
         if source is None:
             incomplete = True
-            warnings.append("At least one candidate test file was oversized, binary, or non-UTF-8.")
+            warnings.append(
+                "At least one candidate test file exceeded bounded source limits or was not "
+                "regular UTF-8 text."
+            )
             continue
         source_bytes = len(source.encode("utf-8"))
         if indexed_bytes + source_bytes > MAX_TEST_INDEX_BYTES:

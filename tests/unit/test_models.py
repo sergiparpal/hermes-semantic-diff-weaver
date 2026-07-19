@@ -76,3 +76,46 @@ def test_output_paths_must_be_repository_relative_posix(path: str) -> None:
 def test_error_response_rejects_unknown_public_code() -> None:
     with pytest.raises(ValidationError):
         ErrorResponse(success=False, error="invented", message="bad", remediation="fix")
+
+
+def test_analysis_summary_and_scope_invariants_are_enforced() -> None:
+    payload = {
+        "analysis_id": "sdw_test",
+        "repository": {
+            "base_ref": "base",
+            "head_ref": "head",
+            "base_commit": "a" * 40,
+            "head_commit": "b" * 40,
+        },
+        "summary": {
+            "changed_files": 1,
+            "changed_symbols": 0,
+            "behavior_changes": 0,
+            "test_obligations": 0,
+            "overall_risk": "low",
+            "risk_score": 0,
+            "overall_confidence": 1,
+            "risk_counts": {
+                "low": 0,
+                "medium": 0,
+                "high": 0,
+                "critical": 0,
+            },
+        },
+        "scope": {
+            "changed_files_total": 1,
+            "analyzed_files": ["src/a.py"],
+            "changed_lines": 1,
+            "changed_symbols": 0,
+        },
+        "behavior_changes": [],
+        "test_obligations": [],
+        "warnings": [],
+        "limitations": [],
+        "llm": {},
+        "deterministic_mode": True,
+    }
+    assert AnalysisResult.model_validate(payload)
+    payload["summary"]["changed_files"] = 2
+    with pytest.raises(ValidationError, match="changed-file counts"):
+        AnalysisResult.model_validate(payload)

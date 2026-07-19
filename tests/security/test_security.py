@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import hermes_semantic_diff_weaver.git_diff as git_diff
 from hermes_semantic_diff_weaver.errors import ErrorCode, WeaverError
 from hermes_semantic_diff_weaver.git_diff import GitRepository
 from hermes_semantic_diff_weaver.plugin import handle_analyze_semantic_diff
@@ -61,7 +62,7 @@ def test_subprocess_timeout_maps_to_safe_error(tmp_path: Path, monkeypatch) -> N
     def timeout(*args, **kwargs):
         raise subprocess.TimeoutExpired(args[0], 1)
 
-    monkeypatch.setattr(subprocess, "run", timeout)
+    monkeypatch.setattr(git_diff, "_run_bounded_process", timeout)
     with pytest.raises(WeaverError) as caught:
         repo.run(["status"])
     assert caught.value.code is ErrorCode.NOT_A_GIT_REPOSITORY

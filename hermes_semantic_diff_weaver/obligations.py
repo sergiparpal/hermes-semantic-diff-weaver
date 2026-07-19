@@ -419,6 +419,19 @@ def generate_obligations(
         overflow_behaviors = [
             behavior for behavior in required_behaviors if behavior.id in overflow_ids
         ]
+        overflow_candidates: list[CandidateTest] = []
+        for behavior_id in overflow_ids:
+            overflow_candidates = _merge_candidate_tests(
+                overflow_candidates, candidate_tests.get(behavior_id, [])
+            )
+        overflow_candidates = overflow_candidates[: config.rules.max_candidate_tests_per_obligation]
+        overflow_origins = {item.origin for item in overflow_behaviors}
+        if overflow_origins == {Origin.LLM_SUPPORTED}:
+            overflow_origin = Origin.LLM_SUPPORTED
+        elif Origin.DETERMINISTIC_FALLBACK in overflow_origins:
+            overflow_origin = Origin.DETERMINISTIC_FALLBACK
+        else:
+            overflow_origin = Origin.DETERMINISTIC
         grouped = TestObligation(
             id="to-000",
             behavior_change_ids=overflow_ids,
@@ -428,9 +441,9 @@ def generate_obligations(
             given="Multiple high-risk behavior changes exceed the individual obligation cap",
             when="The bounded review is planned",
             then="Each linked behavior receives an explicit regression scenario before release",
-            candidate_existing_tests=[],
-            coverage_status=CoverageStatus.NONE_FOUND,
-            origin=overflow_behaviors[0].origin,
+            candidate_existing_tests=overflow_candidates,
+            coverage_status=_coverage_status(overflow_candidates, mapping_incomplete),
+            origin=overflow_origin,
             confidence=min(item.confidence for item in overflow_behaviors),
         )
         selected = [*individually_kept, grouped]

@@ -154,12 +154,38 @@ def exclusion_reason(path: str) -> str | None:
 
 
 def glob_matches(path: str, pattern: str) -> bool:
-    """Cross-platform repository glob matching with intuitive ** root behavior."""
-    normalized = pattern.replace("\\", "/").lstrip("./")
-    if fnmatch.fnmatchcase(path, normalized):
-        return True
-    if normalized.startswith("**/") and fnmatch.fnmatchcase(path, normalized[3:]):
-        return True
+    """Match a repository path using segment-aware ``*`` and recursive ``**`` globs."""
+    normalized_path = path.replace("\\", "/")
+    normalized_pattern = pattern.replace("\\", "/")
+    while normalized_pattern.startswith("./"):
+        normalized_pattern = normalized_pattern[2:]
+    if not normalized_path or not normalized_pattern:
+        return False
+    path_parts = tuple(normalized_path.split("/"))
+    pattern_parts = tuple(normalized_pattern.split("/"))
+    if "" in path_parts or "" in pattern_parts:
+        return False
+
+    pending = [(0, 0)]
+    visited: set[tuple[int, int]] = set()
+    while pending:
+        path_index, pattern_index = pending.pop()
+        if (path_index, pattern_index) in visited:
+            continue
+        visited.add((path_index, pattern_index))
+        if pattern_index == len(pattern_parts):
+            if path_index == len(path_parts):
+                return True
+            continue
+        segment = pattern_parts[pattern_index]
+        if segment == "**":
+            pending.append((path_index, pattern_index + 1))
+            if path_index < len(path_parts):
+                pending.append((path_index + 1, pattern_index))
+            continue
+        if path_index < len(path_parts) and fnmatch.fnmatchcase(path_parts[path_index], segment):
+            pending.append((path_index + 1, pattern_index + 1))
+
     return False
 
 

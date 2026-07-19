@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+import hermes_semantic_diff_weaver.git_diff as git_diff
 from hermes_semantic_diff_weaver.errors import ErrorCode, WeaverError
 from hermes_semantic_diff_weaver.git_diff import (
     MAX_GIT_INPUT_BYTES,
@@ -31,6 +33,21 @@ def test_open_resolve_and_collect(repo_factory) -> None:
     assert result.files[0].new_text
     assert result.files[0].hunks
     assert result.changed_lines == 2
+
+
+def test_git_boundary_rejects_a_filesystem_root_and_invalid_resolver_output(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _: "git")
+    monkeypatch.setattr(GitRepository, "run", lambda self, *args, **kwargs: "/")
+    with pytest.raises(WeaverError) as root_error:
+        GitRepository.open(str(tmp_path))
+    assert root_error.value.code is ErrorCode.PATH_OUTSIDE_REPOSITORY
+
+    repo = GitRepository(tmp_path, "git")
+    with pytest.raises(WeaverError) as ref_error:
+        repo.resolve_ref("main")
+    assert ref_error.value.code is ErrorCode.INVALID_REF
 
 
 def test_crlf_move_and_rename_is_correlated(repo_factory) -> None:
@@ -100,9 +117,9 @@ def test_git_output_and_decode_limits_are_safe(tmp_path: Path, monkeypatch) -> N
     assert input_error.value.code is ErrorCode.DIFF_TOO_LARGE
 
     def huge(*args, **kwargs):
-        return subprocess.CompletedProcess(args[0], 0, stdout=b"x" * 20, stderr=b"")
+        raise git_diff._OutputLimitExceeded
 
-    monkeypatch.setattr(subprocess, "run", huge)
+    monkeypatch.setattr(git_diff, "_run_bounded_process", huge)
     with pytest.raises(WeaverError) as caught:
         repo.run(["status"], max_bytes=10)
     assert caught.value.code is ErrorCode.DIFF_TOO_LARGE
@@ -110,10 +127,21 @@ def test_git_output_and_decode_limits_are_safe(tmp_path: Path, monkeypatch) -> N
     def invalid_utf8(*args, **kwargs):
         return subprocess.CompletedProcess(args[0], 0, stdout=b"\xff", stderr=b"")
 
-    monkeypatch.setattr(subprocess, "run", invalid_utf8)
+    monkeypatch.setattr(git_diff, "_run_bounded_process", invalid_utf8)
     with pytest.raises(WeaverError) as decode_error:
         repo.run(["status"])
     assert decode_error.value.code is ErrorCode.PARSE_FAILURE
+
+
+def test_process_output_is_stopped_while_streaming(tmp_path: Path) -> None:
+    with pytest.raises(git_diff._OutputLimitExceeded):
+        git_diff._run_bounded_process(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * 1000000)"],
+            cwd=tmp_path,
+            env={},
+            input_data=None,
+            max_bytes=1024,
+        )
 
 
 def test_tree_and_blob_batch_parsing_is_bounded(tmp_path: Path, monkeypatch) -> None:
@@ -132,6 +160,7 @@ def test_tree_and_blob_batch_parsing_is_bounded(tmp_path: Path, monkeypatch) -> 
     tree_output = (
         f"100644 blob {good}\tgood.py\0".encode()
         + b"malformed\0"
+        + b"bad-header\tgood.py\0"
         + b"100644 blob invalid\tbad.py\0"
         + f"100644 blob {binary}\t../escape.py\0".encode()
         + f"100644 blob {invalid_utf8}\tother.py\0".encode()
@@ -154,6 +183,7 @@ def test_tree_and_blob_batch_parsing_is_bounded(tmp_path: Path, monkeypatch) -> 
                 f"{invalid_utf8} blob 1\n"
                 f"{oversized} blob 6\n"
                 f"{not_blob} tree 1\n"
+                f"{'9' * 40} blob 1\n"
                 "malformed\n"
             ).encode()
         prefix = (f"{good} blob 5\nhello\n{binary} blob 1\n\0\n{invalid_utf8} blob 1\n").encode()
@@ -195,14 +225,14 @@ def test_collection_batches_tree_and_blob_commands(repo_factory, monkeypatch) ->
         {"one.py": "x = 2\n", "two.py": "y = 2\n"},
     )
     repo = GitRepository.open(str(repo_path))
-    real_run = subprocess.run
+    real_run = git_diff._run_bounded_process
     commands: list[list[str]] = []
 
     def spy(*args, **kwargs):
         commands.append(args[0])
         return real_run(*args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", spy)
+    monkeypatch.setattr(git_diff, "_run_bounded_process", spy)
     result = collect_diff(repo, base, head, WeaverConfig())
     assert len(result.files) == 2
     assert sum("ls-tree" in command for command in commands) == 2
@@ -351,3 +381,40 @@ def test_unsupported_and_oversized_sources_are_explicitly_excluded(repo_factory)
     )
     assert oversized.files == []
     assert oversized.excluded_counts["oversized_or_non_utf8"] == 1
+
+
+def test_resource_limits_are_applied_after_include_filtering(repo_factory) -> None:
+    repo_path, base, head = repo_factory(
+        {"keep.py": "x = 1\n", "ignored.txt": "old\n"},
+        {"keep.py": "x = 2\n", "ignored.txt": "new\n"},
+    )
+    config = WeaverConfig()
+    config.paths.include = ["keep.py"]
+    config.rules.max_changed_files = 1
+    result = collect_diff(GitRepository.open(str(repo_path)), base, head, config)
+    assert [item.path for item in result.files] == ["keep.py"]
+    assert result.truncated is False
+
+
+def test_git_attributes_cannot_hide_utf8_python_as_binary(repo_factory) -> None:
+    attributes = "*.py binary\n"
+    repo_path, base, head = repo_factory(
+        {".gitattributes": attributes, "visible.py": "value = 1\n"},
+        {".gitattributes": attributes, "visible.py": "value = 2\n"},
+    )
+    result = collect_diff(GitRepository.open(str(repo_path)), base, head, WeaverConfig())
+    assert [item.path for item in result.files] == ["visible.py"]
+    assert result.files[0].hunks
+
+
+def test_aggregate_source_cap_is_immutable_and_visible(repo_factory, monkeypatch) -> None:
+    repo_path, base, head = repo_factory(
+        {"bounded.py": "value = 1\n"},
+        {"bounded.py": "value = 2\n"},
+    )
+    monkeypatch.setattr(git_diff, "MAX_SOURCE_BLOB_BYTES", 12)
+    result = collect_diff(GitRepository.open(str(repo_path)), base, head, WeaverConfig())
+    assert result.files == []
+    assert result.truncated is True
+    assert result.excluded_counts["aggregate_source_limit"] == 1
+    assert result.omitted_counts["aggregate_source_limit"] == 1

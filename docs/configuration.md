@@ -55,6 +55,12 @@ and cloud-configuration exclusions. If a file/line budget is exceeded, configure
 prioritized only when this can be done within the same hard bounds; all remaining scope is reported as
 omitted.
 
+Repository configuration cannot raise the immutable collector ceilings: at most 1,000 included
+changed Python files are analyzed, each source blob is limited to 8 MiB, and retained base/head
+source is limited to 64 MiB in aggregate. Configured values below those ceilings remain effective.
+Files omitted by an immutable ceiling are reported explicitly and mark the analysis scope as
+truncated.
+
 Candidate-test indexing also has non-configurable safety ceilings of 500 test files and 8 MiB of
 aggregate UTF-8 test source. These ceilings cannot be expanded by repository configuration. Reaching
 either one emits a warning and uses `mapping_incomplete` when no candidate is found.

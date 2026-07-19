@@ -37,7 +37,7 @@ finding had a linked obligation, and every candidate test remained explicitly un
 The deterministic performance suite covers both a 100-symbol AST fixture and a warmed full-service
 fixture with 40 files, 3,000 changed lines, and 100 symbols, each with the plan's five-second ceiling.
 They completed in approximately 0.012 seconds and 0.389 seconds respectively in the final
-local timing run. The complete automated suite reports 92.96% overall branch-aware coverage, with at
+local timing run. The complete automated suite reports over 93.9% overall branch-aware coverage, with at
 least 90% branch coverage in each critical boundary/transport module. No live LLM call or credential
 was used.
 
