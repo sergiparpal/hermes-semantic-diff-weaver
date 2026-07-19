@@ -62,7 +62,8 @@ fixture review so evaluation does not reward an unsupported state-change finding
 - LLM batching connects same-module evidence and cross-module changes sharing a changed dependency
   call before applying input and call ceilings.
 - Candidate-test discovery now has aggregate file and byte safety caps, and the full deterministic
-  performance regression ceiling is five seconds as required by the implementation plan.
+  performance regression ceiling is five seconds as required by the project performance
+  specification.
   Performance fixtures pause coverage tracing while timed application code runs, so the ceiling
   consistently measures production execution rather than instrumentation overhead across systems.
 - Committed tree metadata and source blobs are collected in bounded Git plumbing batches instead of
