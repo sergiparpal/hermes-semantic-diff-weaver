@@ -10,6 +10,7 @@ from hermes_semantic_diff_weaver.service import analyze
 
 
 @pytest.mark.performance
+@pytest.mark.no_cover
 def test_near_symbol_limit_preprocessing_is_under_reference_target() -> None:
     old = "\n\n".join(f"def function_{index}(x):\n    return x < {index}" for index in range(100))
     new = "\n\n".join(f"def function_{index}(x):\n    return x <= {index}" for index in range(100))
@@ -29,6 +30,7 @@ def test_near_symbol_limit_preprocessing_is_under_reference_target() -> None:
 
 
 @pytest.mark.performance
+@pytest.mark.no_cover
 def test_full_deterministic_pipeline_near_default_limits(repo_factory) -> None:
     old_files: dict[str, str] = {}
     new_files: dict[str, str] = {}

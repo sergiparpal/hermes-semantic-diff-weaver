@@ -63,5 +63,7 @@ fixture review so evaluation does not reward an unsupported state-change finding
   call before applying input and call ceilings.
 - Candidate-test discovery now has aggregate file and byte safety caps, and the full deterministic
   performance regression ceiling is five seconds as required by the implementation plan.
+  Performance fixtures pause coverage tracing while timed application code runs, so the ceiling
+  consistently measures production execution rather than instrumentation overhead across systems.
 - All 17 evaluation cases now have reviewed, normalized canonical JSON goldens in addition to their
   machine-readable category/evidence/scenario labels.
