@@ -42,6 +42,7 @@ def test_git_runner_disables_global_config_attributes_and_paging(repo_factory, m
         assert environment["GIT_ATTR_NOSYSTEM"] == "1"
         assert environment["GIT_CONFIG_GLOBAL"]
         assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert environment["GIT_NO_LAZY_FETCH"] == "1"
         assert environment["GIT_PAGER"] == "cat"
 
 
@@ -91,3 +92,21 @@ def test_newline_filename_is_parsed_without_record_corruption(repo_factory) -> N
     )
     result = collect_diff(GitRepository.open(str(repo)), base, head, WeaverConfig())
     assert [item.path for item in result.files] == [path]
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows filesystems cannot represent filenames containing wildcard characters.",
+)
+def test_git_reported_paths_are_used_as_literal_pathspecs(repo_factory) -> None:
+    wildcard = "src/star*.py"
+    matching_name = "src/star-other.py"
+    repo, base, head = repo_factory(
+        {wildcard: "x = 1\n", matching_name: "y = 1\n"},
+        {wildcard: "x = 2\n", matching_name: "y = 2\n"},
+    )
+    result = collect_diff(GitRepository.open(str(repo)), base, head, WeaverConfig())
+    assert {item.path: len(item.hunks) for item in result.files} == {
+        wildcard: 1,
+        matching_name: 1,
+    }

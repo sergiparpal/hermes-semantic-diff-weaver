@@ -8,6 +8,7 @@ import pytest
 
 from hermes_semantic_diff_weaver.errors import ErrorCode, WeaverError
 from hermes_semantic_diff_weaver.git_diff import (
+    MAX_GIT_INPUT_BYTES,
     GitRepository,
     _parse_name_status,
     _parse_numstat,
@@ -94,6 +95,10 @@ def test_nonexistent_ref_and_blob_paths_are_bounded(repo_factory) -> None:
 def test_git_output_and_decode_limits_are_safe(tmp_path: Path, monkeypatch) -> None:
     repo = GitRepository(tmp_path, "git")
 
+    with pytest.raises(WeaverError) as input_error:
+        repo.run(["cat-file", "--batch"], input_data=b"x" * (MAX_GIT_INPUT_BYTES + 1))
+    assert input_error.value.code is ErrorCode.DIFF_TOO_LARGE
+
     def huge(*args, **kwargs):
         return subprocess.CompletedProcess(args[0], 0, stdout=b"x" * 20, stderr=b"")
 
@@ -109,6 +114,101 @@ def test_git_output_and_decode_limits_are_safe(tmp_path: Path, monkeypatch) -> N
     with pytest.raises(WeaverError) as decode_error:
         repo.run(["status"])
     assert decode_error.value.code is ErrorCode.PARSE_FAILURE
+
+
+def test_tree_and_blob_batch_parsing_is_bounded(tmp_path: Path, monkeypatch) -> None:
+    repo = GitRepository(tmp_path, "git")
+    commit = "a" * 40
+    good = "b" * 40
+    binary = "c" * 40
+    invalid_utf8 = "d" * 40
+    oversized = "e" * 40
+    not_blob = "f" * 40
+
+    with pytest.raises(WeaverError):
+        repo.tree_entries("unresolved", ["good.py"])
+    assert repo.tree_entries(commit, []) == {}
+
+    tree_output = (
+        f"100644 blob {good}\tgood.py\0".encode()
+        + b"malformed\0"
+        + b"100644 blob invalid\tbad.py\0"
+        + f"100644 blob {binary}\t../escape.py\0".encode()
+        + f"100644 blob {invalid_utf8}\tother.py\0".encode()
+        + f"\xff blob {oversized}\tbad-mode.py\0".encode()
+    )
+    monkeypatch.setattr(repo, "run", lambda *args, **kwargs: tree_output)
+    entries = repo.tree_entries(commit, ["good.py"])
+    assert entries["good.py"].mode == "100644"
+    assert entries["good.py"].object_id == good
+
+    with pytest.raises(WeaverError):
+        repo.read_blob_objects({"invalid"}, 5)
+    assert repo.read_blob_objects(set(), 5) == {}
+
+    def batch_output(arguments, **kwargs):
+        if "--batch-check" in arguments:
+            return (
+                f"{good} blob 5\n"
+                f"{binary} blob 1\n"
+                f"{invalid_utf8} blob 1\n"
+                f"{oversized} blob 6\n"
+                f"{not_blob} tree 1\n"
+                "malformed\n"
+            ).encode()
+        prefix = (f"{good} blob 5\nhello\n{binary} blob 1\n\0\n{invalid_utf8} blob 1\n").encode()
+        return prefix + b"\xff\n"
+
+    monkeypatch.setattr(repo, "run", batch_output)
+    blobs = repo.read_blob_objects({good, binary, invalid_utf8, oversized, not_blob}, max_bytes=5)
+    assert blobs == {
+        good: "hello",
+        binary: None,
+        invalid_utf8: None,
+        oversized: None,
+        not_blob: None,
+    }
+
+
+def test_blob_batch_failures_remain_safe(tmp_path: Path, monkeypatch) -> None:
+    repo = GitRepository(tmp_path, "git")
+    object_id = "a" * 40
+
+    def fail(*args, **kwargs):
+        raise WeaverError(ErrorCode.INVALID_REF, "safe", "retry")
+
+    monkeypatch.setattr(repo, "run", fail)
+    assert repo.read_blob_objects({object_id}, 5) == {object_id: None}
+
+    def fail_content(arguments, **kwargs):
+        if "--batch-check" in arguments:
+            return f"{object_id} blob 5\n".encode()
+        raise WeaverError(ErrorCode.INVALID_REF, "safe", "retry")
+
+    monkeypatch.setattr(repo, "run", fail_content)
+    assert repo.read_blob_objects({object_id}, 5) == {object_id: None}
+
+
+def test_collection_batches_tree_and_blob_commands(repo_factory, monkeypatch) -> None:
+    repo_path, base, head = repo_factory(
+        {"one.py": "x = 1\n", "two.py": "y = 1\n"},
+        {"one.py": "x = 2\n", "two.py": "y = 2\n"},
+    )
+    repo = GitRepository.open(str(repo_path))
+    real_run = subprocess.run
+    commands: list[list[str]] = []
+
+    def spy(*args, **kwargs):
+        commands.append(args[0])
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    result = collect_diff(repo, base, head, WeaverConfig())
+    assert len(result.files) == 2
+    assert sum("ls-tree" in command for command in commands) == 2
+    assert sum("--batch-check" in command for command in commands) == 1
+    assert sum("--batch" in command for command in commands) == 1
+    assert all("show" not in command for command in commands)
 
 
 def test_oversized_diff_can_prioritize_explicit_critical_scope(repo_factory) -> None:

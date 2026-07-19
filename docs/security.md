@@ -13,8 +13,9 @@ import.
 - Target code is never imported or executed; tests, hooks, interpreters, builders, package managers,
   generators, and non-Git repository tools are never run.
 - Base/head refs are resolved to full commits before diff and blob commands.
-- Git uses argument arrays, `shell=False`, timeouts, bounded output, noninteractive operation,
-  `--no-ext-diff`, and `--no-textconv` where relevant.
+- Git uses argument arrays, `shell=False`, timeouts, bounded input/output, noninteractive operation,
+  disabled lazy object fetching, literal untrusted pathspecs, `--no-ext-diff`, and `--no-textconv`
+  where relevant.
 - Every Git/config path is normalized and checked; VCS metadata, traversal, absolute/drive/UNC paths,
   reserved device names, and mandatory secret classes are rejected or excluded.
 - Repository-local config symlinks must resolve inside the repository, and both sides of a rename are

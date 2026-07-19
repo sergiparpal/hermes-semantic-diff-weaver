@@ -11,7 +11,9 @@ request/config -> repository + resolved refs -> changed committed blobs -> AST d
 `plugin.py` is the only Hermes adapter. Registration closes over `ctx.llm` but performs no Git or LLM
 work. `service.py` orchestrates modules without importing Hermes internals. `git_diff.py` is the sole
 subprocess boundary and invokes only Git with argument arrays, resolved commit IDs, timeouts, bounded
-captured output, disabled external diff/text conversion, and `shell=False`.
+captured input/output, disabled external diff/text conversion, and `shell=False`. Tree metadata is
+collected once per revision and eligible object IDs are read through bounded `cat-file` batches;
+per-file patch hunks retain literal path isolation.
 
 `ast_diff.py` parses text with the Python AST without importing target modules. It inventories module,
 class, function, async-function, method, and async-method symbols; normalizes complete signatures

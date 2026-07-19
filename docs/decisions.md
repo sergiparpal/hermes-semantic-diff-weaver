@@ -65,5 +65,8 @@ fixture review so evaluation does not reward an unsupported state-change finding
   performance regression ceiling is five seconds as required by the implementation plan.
   Performance fixtures pause coverage tracing while timed application code runs, so the ceiling
   consistently measures production execution rather than instrumentation overhead across systems.
+- Committed tree metadata and source blobs are collected in bounded Git plumbing batches instead of
+  spawning size/read/mode processes per file; literal pathspecs and disabled lazy fetching preserve
+  the repository boundary while meeting the cross-platform performance target.
 - All 17 evaluation cases now have reviewed, normalized canonical JSON goldens in addition to their
   machine-readable category/evidence/scenario labels.

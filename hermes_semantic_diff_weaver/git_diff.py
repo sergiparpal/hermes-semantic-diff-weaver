@@ -16,6 +16,7 @@ from .path_policy import exclusion_reason, glob_matches, is_included, normalize_
 
 GIT_TIMEOUT_SECONDS = 15
 MAX_GIT_OUTPUT_BYTES = 16 * 1024 * 1024
+MAX_GIT_INPUT_BYTES = 2 * 1024 * 1024
 # Git's 50% default misses small CRLF renames; AST matching still rejects ambiguous symbols.
 RENAME_DETECTION_ARGUMENTS = ("-M40%", "-C40%")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40,64}$")
@@ -58,6 +59,12 @@ class DiffCollection:
     warnings: list[str]
     omitted_counts: dict[str, int] = field(default_factory=dict)
     truncated: bool = False
+
+
+@dataclass(frozen=True)
+class GitTreeEntry:
+    mode: str
+    object_id: str
 
 
 def _git_error(code: ErrorCode, message: str, remediation: str) -> WeaverError:
@@ -114,6 +121,7 @@ class GitRepository:
         *,
         max_bytes: int = MAX_GIT_OUTPUT_BYTES,
         binary: bool = False,
+        input_data: bytes | None = None,
     ) -> str | bytes:
         env = os.environ.copy()
         env.update(
@@ -123,21 +131,31 @@ class GitRepository:
                 "GIT_TERMINAL_PROMPT": "0",
                 "GIT_OPTIONAL_LOCKS": "0",
                 "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_NO_LAZY_FETCH": "1",
                 "GIT_PAGER": "cat",
                 "LC_ALL": "C.UTF-8",
             }
         )
         command = [self.git, "--no-pager", "-c", "core.quotepath=false", *arguments]
+        if input_data is not None and len(input_data) > MAX_GIT_INPUT_BYTES:
+            raise _git_error(
+                ErrorCode.DIFF_TOO_LARGE,
+                "Git input exceeded the bounded collection limit.",
+                "Narrow the include patterns or split the change.",
+            )
+        input_arguments = (
+            {"stdin": subprocess.DEVNULL} if input_data is None else {"input": input_data}
+        )
         try:
             completed = subprocess.run(
                 command,
                 cwd=self.root,
                 env=env,
                 shell=False,
-                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 timeout=GIT_TIMEOUT_SECONDS,
                 check=False,
+                **input_arguments,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise _git_error(
@@ -246,6 +264,130 @@ class GitRepository:
         except UnicodeDecodeError:
             return None
 
+    def tree_entries(self, commit: str, paths: list[str]) -> dict[str, GitTreeEntry]:
+        """Read modes and object IDs for literal committed paths in one bounded command."""
+        if not COMMIT_RE.fullmatch(commit):
+            raise _git_error(ErrorCode.INVALID_REF, "An unresolved commit was rejected.", "Retry.")
+        normalized_paths = sorted({normalize_repo_path(path) for path in paths})
+        if not normalized_paths:
+            return {}
+        raw = self.run(
+            [
+                "ls-tree",
+                "-z",
+                commit,
+                "--",
+                *(f":(literal){path}" for path in normalized_paths),
+            ],
+            binary=True,
+        )
+        requested = set(normalized_paths)
+        entries: dict[str, GitTreeEntry] = {}
+        for record in raw.split(b"\x00"):
+            if not record or b"\t" not in record:
+                continue
+            header, path_raw = record.split(b"\t", 1)
+            parts = header.split(b" ", 2)
+            if len(parts) != 3:
+                continue
+            try:
+                mode = parts[0].decode("ascii", errors="strict")
+                object_id = parts[2].decode("ascii", errors="strict")
+                path = normalize_repo_path(path_raw.decode("utf-8", errors="strict"))
+            except (UnicodeDecodeError, WeaverError):
+                continue
+            if path in requested and COMMIT_RE.fullmatch(object_id):
+                entries[path] = GitTreeEntry(mode=mode, object_id=object_id)
+        return entries
+
+    def read_blob_objects(self, object_ids: set[str], max_bytes: int) -> dict[str, str | None]:
+        """Read many bounded blob objects with batch plumbing instead of per-file processes."""
+        requested = sorted(object_ids)
+        if any(not COMMIT_RE.fullmatch(object_id) for object_id in requested):
+            raise _git_error(ErrorCode.INVALID_REF, "An invalid object ID was rejected.", "Retry.")
+        result: dict[str, str | None] = dict.fromkeys(requested)
+        if not requested:
+            return result
+        batch_input = b"".join(f"{object_id}\n".encode("ascii") for object_id in requested)
+        try:
+            raw_info = self.run(
+                ["cat-file", "--batch-check"],
+                max_bytes=max(1024, len(requested) * 128),
+                binary=True,
+                input_data=batch_input,
+            )
+        except WeaverError:
+            return result
+        eligible: list[tuple[str, int]] = []
+        for line in raw_info.splitlines():
+            parts = line.split(b" ")
+            if len(parts) != 3 or parts[1] != b"blob":
+                continue
+            try:
+                object_id = parts[0].decode("ascii", errors="strict")
+                size = int(parts[2])
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if object_id in result and 0 <= size <= max_bytes:
+                eligible.append((object_id, size))
+
+        chunk_budget = max(MAX_GIT_OUTPUT_BYTES, max_bytes + 1024)
+        chunks: list[list[tuple[str, int]]] = []
+        current: list[tuple[str, int]] = []
+        current_bytes = 0
+        for object_id, size in eligible:
+            estimated_bytes = size + len(object_id) + 32
+            if current and current_bytes + estimated_bytes > chunk_budget:
+                chunks.append(current)
+                current = []
+                current_bytes = 0
+            current.append((object_id, size))
+            current_bytes += estimated_bytes
+        if current:
+            chunks.append(current)
+
+        for chunk in chunks:
+            chunk_input = b"".join(f"{object_id}\n".encode("ascii") for object_id, _ in chunk)
+            expected_bytes = sum(size + len(object_id) + 32 for object_id, size in chunk)
+            try:
+                raw_blobs = self.run(
+                    ["cat-file", "--batch"],
+                    max_bytes=max(1024, expected_bytes),
+                    binary=True,
+                    input_data=chunk_input,
+                )
+            except WeaverError:
+                continue
+            offset = 0
+            while offset < len(raw_blobs):
+                header_end = raw_blobs.find(b"\n", offset)
+                if header_end < 0:
+                    break
+                header = raw_blobs[offset:header_end].split(b" ")
+                if len(header) != 3 or header[1] != b"blob":
+                    break
+                try:
+                    object_id = header[0].decode("ascii", errors="strict")
+                    size = int(header[2])
+                except (UnicodeDecodeError, ValueError):
+                    break
+                content_start = header_end + 1
+                content_end = content_start + size
+                if (
+                    content_end >= len(raw_blobs)
+                    or raw_blobs[content_end : content_end + 1] != b"\n"
+                ):
+                    break
+                content = raw_blobs[content_start:content_end]
+                offset = content_end + 1
+                if object_id not in result or b"\x00" in content:
+                    continue
+                try:
+                    result[object_id] = content.decode("utf-8", errors="strict")
+                except UnicodeDecodeError:
+                    continue
+        return result
+
     def list_files(self, commit: str, max_bytes: int = MAX_GIT_OUTPUT_BYTES) -> list[str]:
         raw = self.run(
             ["ls-tree", "-r", "-z", "--name-only", commit, "--"],
@@ -323,7 +465,7 @@ def _hunks(repo: GitRepository, base: str, head: str, path: str) -> list[Hunk]:
             base,
             head,
             "--",
-            path,
+            f":(literal){path}",
         ],
         max_bytes=4 * 1024 * 1024,
     )
@@ -469,6 +611,7 @@ def collect_diff(
         files, stats, changed_lines, config
     )
     excluded: Counter[str] = Counter()
+    candidates: list[ChangedFile] = []
     selected: list[ChangedFile] = []
     warnings: list[str] = list(resource_warnings)
     for changed in files:
@@ -501,32 +644,38 @@ def collect_diff(
         if binary:
             excluded["binary"] += 1
             continue
-        modes = {
-            repo.entry_mode(commit, candidate_path)
-            for commit, candidate_path in (
-                (base_commit, changed.old_path),
-                (head_commit, changed.new_path),
-            )
-            if candidate_path
-        }
+        candidates.append(changed)
+
+    base_entries = repo.tree_entries(
+        base_commit, [item.old_path for item in candidates if item.old_path]
+    )
+    head_entries = repo.tree_entries(
+        head_commit, [item.new_path for item in candidates if item.new_path]
+    )
+    object_ids = {
+        entry.object_id
+        for entries in (base_entries, head_entries)
+        for entry in entries.values()
+        if entry.mode not in {"120000", "160000"}
+    }
+    blob_text = repo.read_blob_objects(object_ids, config.rules.max_file_bytes)
+
+    for changed in candidates:
+        old_entry = base_entries.get(changed.old_path) if changed.old_path else None
+        new_entry = head_entries.get(changed.new_path) if changed.new_path else None
+        modes = {entry.mode for entry in (old_entry, new_entry) if entry is not None}
         if modes & {"120000", "160000"}:
             excluded["symlink_or_gitlink"] += 1
             continue
-        changed.hunks = _hunks(repo, base_commit, head_commit, path)
-        if changed.old_path:
-            changed.old_text = repo.read_blob(
-                base_commit, changed.old_path, config.rules.max_file_bytes
-            )
-        if changed.new_path:
-            changed.new_text = repo.read_blob(
-                head_commit, changed.new_path, config.rules.max_file_bytes
-            )
+        changed.old_text = blob_text.get(old_entry.object_id) if old_entry else None
+        changed.new_text = blob_text.get(new_entry.object_id) if new_entry else None
         if (changed.old_path and changed.old_text is None) or (
             changed.new_path and changed.new_text is None
         ):
             excluded["oversized_or_non_utf8"] += 1
-            warnings.append(f"Skipped bounded source parsing for {path!r}.")
+            warnings.append(f"Skipped bounded source parsing for {changed.path!r}.")
             continue
+        changed.hunks = _hunks(repo, base_commit, head_commit, changed.path)
         selected.append(changed)
     return DiffCollection(
         files=selected,
