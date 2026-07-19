@@ -31,7 +31,9 @@ def main() -> int:
         failures.append(f"overall coverage {overall:.2f}% is below {OVERALL_MINIMUM:.0f}%")
     files = report["files"]
     for module in CRITICAL_MODULES:
-        matches = [value for path, value in files.items() if path.endswith(f"/{module}")]
+        matches = [
+            value for path, value in files.items() if path.replace("\\", "/").endswith(f"/{module}")
+        ]
         if len(matches) != 1:
             failures.append(f"critical module {module} is missing or duplicated in the report")
             continue
