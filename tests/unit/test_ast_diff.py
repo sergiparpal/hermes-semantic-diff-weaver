@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hermes_semantic_diff_weaver.ast_diff as ast_diff
 from hermes_semantic_diff_weaver.ast_diff import analyze_ast
 from hermes_semantic_diff_weaver.git_diff import ChangedFile, Hunk
 
@@ -17,6 +18,16 @@ def changed(old: str, new: str) -> ChangedFile:
 
 def kinds(old: str, new: str) -> set[str]:
     return {item.kind for item in analyze_ast([changed(old, new)]).deltas}
+
+
+def test_ast_symbol_budget_fails_closed(monkeypatch) -> None:
+    monkeypatch.setattr(ast_diff, "MAX_SYMBOLS_PER_FILE", 3)
+    source = "\n".join(f"def function_{index}():\n    return {index}\n" for index in range(4))
+    result = analyze_ast([changed(source, source.replace("return", "return +"))])
+    assert result.resource_limited_files == 1
+    assert result.failed_files == 1
+    assert result.deltas[0].kind == "parse_incomplete"
+    assert result.deltas[0].metadata["resource_limited"] is True
 
 
 def test_extracts_required_structural_delta_classes() -> None:

@@ -7,6 +7,8 @@ import pytest
 import hermes_semantic_diff_weaver.path_policy as path_policy
 from hermes_semantic_diff_weaver.errors import WeaverError
 from hermes_semantic_diff_weaver.path_policy import (
+    ALLOWED_ROOTS_ENV,
+    ensure_authorized_path,
     ensure_contained,
     exclusion_reason,
     glob_matches,
@@ -63,9 +65,24 @@ def test_mandatory_exclusions(path: str, reason: str) -> None:
 
 
 def test_inline_secrets_are_redacted_and_bounded() -> None:
-    source = "api_key = 'abcdefghijklmnopqrstuvwxyz123456'\nsk-abcdefghijklmnopqrstuvwxyz"
-    redacted = redact_text(source, max_chars=100)
+    source = (
+        "api_key = 'abcdefghijklmnopqrstuvwxyz123456'\n"
+        "CLIENT_SECRET = 'client-secret-value-1234'\n"
+        "AWS_SECRET_ACCESS_KEY = 'aws-secret-value-5678'\n"
+        "PASSWORD = 'abc'\n"
+        "database_url = 'postgres://user:database-password@db/internal'\n"
+        "Authorization: Bearer authorization-token-9012\n"
+        "Proxy-Authorization: Bearer xyz\n"
+        "sk-abcdefghijklmnopqrstuvwxyz"
+    )
+    redacted = redact_text(source, max_chars=1000)
     assert "abcdefghijklmnopqrstuvwxyz" not in redacted
+    assert "client-secret-value" not in redacted
+    assert "aws-secret-value" not in redacted
+    assert "abc" not in redacted
+    assert "database-password" not in redacted
+    assert "authorization-token" not in redacted
+    assert "xyz" not in redacted
     assert "[REDACTED]" in redacted
     assert len(redact_text("x" * 100, max_chars=12)) == 12
 
@@ -86,6 +103,34 @@ def test_resolved_containment_accepts_inside_and_rejects_outside(tmp_path: Path)
     outside.write_text("x = 2\n", encoding="utf-8")
     with pytest.raises(WeaverError):
         ensure_contained(tmp_path, outside)
+
+
+def test_caller_selected_paths_require_host_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    inside = allowed / "profile.yaml"
+    inside.write_text("version: 1\n", encoding="utf-8")
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("version: 1\n", encoding="utf-8")
+    monkeypatch.setenv(ALLOWED_ROOTS_ENV, str(allowed))
+    assert ensure_authorized_path(inside) == inside.resolve()
+    with pytest.raises(WeaverError):
+        ensure_authorized_path(outside)
+
+
+def test_invalid_authorized_root_configuration_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for configured in (
+        path_policy.os.pathsep,
+        str(Path(tmp_path.anchor)),
+        str(tmp_path / "missing-workspace-root"),
+    ):
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, configured)
+        with pytest.raises(WeaverError):
+            path_policy.authorized_roots()
 
 
 def test_non_secret_token_source_and_windows_devices_are_handled(

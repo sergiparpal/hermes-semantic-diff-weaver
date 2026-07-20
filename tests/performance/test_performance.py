@@ -31,6 +31,35 @@ def test_near_symbol_limit_preprocessing_is_under_reference_target() -> None:
 
 @pytest.mark.performance
 @pytest.mark.no_cover
+def test_mass_rename_matching_is_bounded() -> None:
+    count = 500
+    old = "".join(f"def old_{index}(x):\n    return x + {index}\n" for index in range(count))
+    new = "".join(f"def new_{index}(x):\n    return x - {index}\n" for index in range(count))
+    changed = ChangedFile(
+        status="M",
+        old_path="src/many.py",
+        new_path="src/many.py",
+        old_text=old,
+        new_text=new,
+        hunks=[
+            Hunk(
+                id="hunk-001",
+                old_start=1,
+                old_count=count * 2,
+                new_start=1,
+                new_count=count * 2,
+            )
+        ],
+    )
+    started = time.perf_counter()
+    result = analyze_ast([changed])
+    elapsed = time.perf_counter() - started
+    assert result.changed_symbols == count * 2
+    assert elapsed < 2.0
+
+
+@pytest.mark.performance
+@pytest.mark.no_cover
 def test_full_deterministic_pipeline_near_default_limits(repo_factory) -> None:
     old_files: dict[str, str] = {}
     new_files: dict[str, str] = {}

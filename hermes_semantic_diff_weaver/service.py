@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -28,7 +29,7 @@ from .models import (
     WeaverConfig,
 )
 from .obligations import generate_obligations
-from .path_policy import exclusion_reason, glob_matches, redact_text
+from .path_policy import ensure_authorized_path, exclusion_reason, glob_matches, redact_text
 from .renderer import render_transport
 from .scoring import confidence_score, score_risk
 from .semantic_candidates import SemanticCandidate, build_candidates
@@ -158,7 +159,9 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
         request = AnalyzeRequest.model_validate(arguments)
     except ValidationError as exc:
         raise _validation_error(exc) from exc
-    repo = GitRepository.open(request.repo_path)
+    authorized_request_path = ensure_authorized_path(Path(request.repo_path))
+    repo = GitRepository.open(str(authorized_request_path))
+    ensure_authorized_path(repo.root)
     base_commit = repo.resolve_ref(request.base_ref)
     head_commit = repo.resolve_ref(request.head_ref)
     config, config_warnings = load_config(repo.root, request)
@@ -180,8 +183,14 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
     ]
     scope_truncated = collection.truncated or bool(incomplete_exclusions)
     confidence_truncated = collection.truncated or bool(incomplete_exclusions)
-    if ast_result.failed_files:
-        omitted.append(OmittedScope(reason="parse_incomplete_files", count=ast_result.failed_files))
+    syntax_failed_files = ast_result.failed_files - ast_result.resource_limited_files
+    if syntax_failed_files:
+        omitted.append(OmittedScope(reason="parse_incomplete_files", count=syntax_failed_files))
+        scope_truncated = True
+    if ast_result.resource_limited_files:
+        omitted.append(
+            OmittedScope(reason="ast_resource_limit", count=ast_result.resource_limited_files)
+        )
         scope_truncated = True
     deltas = ast_result.deltas
     changed_symbols = ast_result.changed_symbols
@@ -339,6 +348,11 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
     if ast_result.failed_files:
         limitations.append(
             f"{ast_result.failed_files} changed Python file(s) had incomplete parser context."
+        )
+    if ast_result.resource_limited_files:
+        limitations.append(
+            f"{ast_result.resource_limited_files} changed Python file(s) exceeded immutable AST "
+            "safety budgets."
         )
     if incomplete_exclusions:
         limitations.append(

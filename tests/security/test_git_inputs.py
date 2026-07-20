@@ -27,6 +27,8 @@ def test_git_runner_never_uses_shell(repo_factory, monkeypatch) -> None:
 
 def test_git_runner_disables_global_config_attributes_and_paging(repo_factory, monkeypatch) -> None:
     repo_path, base, head = repo_factory({"a.py": "x = 1\n"}, {"a.py": "x = 2\n"})
+    monkeypatch.setenv("GIT_DIR", "/untrusted/git-dir")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     real_popen = subprocess.Popen
     observed: list[tuple[list[str], dict[str, str]]] = []
 
@@ -38,12 +40,23 @@ def test_git_runner_disables_global_config_attributes_and_paging(repo_factory, m
     collect_diff(GitRepository.open(str(repo_path)), base, head, WeaverConfig())
     assert observed
     for command, environment in observed:
-        assert command[1] == "--no-pager"
+        assert command[1:3] == ["--no-replace-objects", "--no-pager"]
         assert environment["GIT_ATTR_NOSYSTEM"] == "1"
         assert environment["GIT_CONFIG_GLOBAL"]
         assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
         assert environment["GIT_NO_LAZY_FETCH"] == "1"
+        assert environment["GIT_NO_REPLACE_OBJECTS"] == "1"
         assert environment["GIT_PAGER"] == "cat"
+        assert "GIT_DIR" not in environment
+        assert "GIT_CONFIG_COUNT" not in environment
+
+
+def test_replacement_refs_cannot_substitute_analyzed_commits(repo_factory) -> None:
+    repo_path, base, head = repo_factory({"a.py": "x = 1\n"}, {"a.py": "x = 2\n"})
+    git(repo_path, "replace", base, head)
+    result = collect_diff(GitRepository.open(str(repo_path)), base, head, WeaverConfig())
+    assert [item.path for item in result.files] == ["a.py"]
+    assert result.files[0].old_text == "x = 1\n"
 
 
 def test_external_diff_driver_is_not_invoked(repo_factory) -> None:

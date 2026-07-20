@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Harden secret egress, model-data framing, terminal/control rendering, repository authorization,
+  Git replacement-object handling, inherited Git environment isolation, configuration complexity,
+  and adversarial AST resource limits.
+
 ## 0.1.0 - 2026-07-18
 
 - Add the read-only `analyze_semantic_diff` Hermes tool.

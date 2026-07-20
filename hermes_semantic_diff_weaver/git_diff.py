@@ -252,7 +252,12 @@ class GitRepository:
         binary: bool = False,
         input_data: bytes | None = None,
     ) -> str | bytes:
-        env = os.environ.copy()
+        # Inherited Git variables can redirect the repository, object database, config, namespace,
+        # or replacement refs. Preserve the host environment needed to launch Git, but rebuild the
+        # Git-specific portion from a strict allowlist.
+        env = {
+            key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")
+        }
         env.update(
             {
                 "GIT_ATTR_NOSYSTEM": "1",
@@ -261,11 +266,19 @@ class GitRepository:
                 "GIT_OPTIONAL_LOCKS": "0",
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_NO_LAZY_FETCH": "1",
+                "GIT_NO_REPLACE_OBJECTS": "1",
                 "GIT_PAGER": "cat",
                 "LC_ALL": "C.UTF-8",
             }
         )
-        command = [self.git, "--no-pager", "-c", "core.quotepath=false", *arguments]
+        command = [
+            self.git,
+            "--no-replace-objects",
+            "--no-pager",
+            "-c",
+            "core.quotepath=false",
+            *arguments,
+        ]
         if input_data is not None and len(input_data) > MAX_GIT_INPUT_BYTES:
             raise _git_error(
                 ErrorCode.DIFF_TOO_LARGE,

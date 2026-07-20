@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from hermes_semantic_diff_weaver.config import _validate_config_paths, load_config
+from hermes_semantic_diff_weaver.config import _read_yaml, _validate_config_paths, load_config
 from hermes_semantic_diff_weaver.errors import ErrorCode, WeaverError
 from hermes_semantic_diff_weaver.models import AnalyzeRequest
 
@@ -67,6 +68,22 @@ def test_oversized_profile_is_rejected(tmp_path: Path) -> None:
     profile.write_text("x" * (256 * 1024 + 1), encoding="utf-8")
     with pytest.raises(WeaverError):
         load_config(tmp_path, request(tmp_path, risk_profile=str(profile)))
+
+
+def test_yaml_depth_and_alias_budgets_fail_closed(tmp_path: Path) -> None:
+    deep = tmp_path / "deep.yaml"
+    nested = "".join(f"{'  ' * depth}item_{depth}:\n" for depth in range(51))
+    deep.write_text(f"{nested}{'  ' * 51}leaf: true\n", encoding="utf-8")
+    with pytest.raises(WeaverError, match="depth limit"):
+        _read_yaml(deep)
+
+    aliases = tmp_path / "aliases.yaml"
+    aliases.write_text(
+        "anchor: &anchor safe\nitems: [" + ", ".join("*anchor" for _ in range(101)) + "]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(WeaverError, match="alias limit"):
+        _read_yaml(aliases)
 
 
 def test_missing_wrong_extension_and_empty_profiles(tmp_path: Path) -> None:
@@ -137,8 +154,8 @@ def test_malformed_path_sections_are_left_for_strict_model_validation() -> None:
 
 
 def test_empty_pattern_and_single_hermes_config_are_covered(tmp_path: Path) -> None:
-    with pytest.raises(WeaverError):
-        load_config(tmp_path, request(tmp_path, include=[""]))
+    with pytest.raises(ValidationError):
+        request(tmp_path, include=[""])
     (tmp_path / ".hermes").mkdir()
     (tmp_path / ".hermes" / "semantic-diff-weaver.yaml").write_text(
         "version: 1\n", encoding="utf-8"

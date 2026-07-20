@@ -11,6 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .errors import ErrorCode
 
 SCHEMA_VERSION: Literal["1.0"] = "1.0"
+MAX_PATH_CHARS = 4096
+MAX_REF_CHARS = 1024
+MAX_PATTERN_CHARS = 512
+MAX_PATH_PATTERNS = 256
+RelativePattern = Annotated[str, Field(min_length=1, max_length=MAX_PATTERN_CHARS)]
 
 
 class StrictModel(BaseModel):
@@ -88,23 +93,23 @@ class Presentation(StrEnum):
 
 
 class AnalyzeRequest(StrictModel):
-    repo_path: str = Field(min_length=1)
-    base_ref: str = Field(min_length=1)
-    head_ref: str = Field(default="HEAD", min_length=1)
-    risk_profile: str | None = None
-    include: list[str] | None = None
-    exclude: list[str] | None = None
+    repo_path: str = Field(min_length=1, max_length=MAX_PATH_CHARS)
+    base_ref: str = Field(min_length=1, max_length=MAX_REF_CHARS)
+    head_ref: str = Field(default="HEAD", min_length=1, max_length=MAX_REF_CHARS)
+    risk_profile: str | None = Field(default=None, max_length=MAX_PATH_CHARS)
+    include: Annotated[list[RelativePattern], Field(max_length=MAX_PATH_PATTERNS)] | None = None
+    exclude: Annotated[list[RelativePattern], Field(max_length=MAX_PATH_PATTERNS)] | None = None
     output_format: OutputFormat = OutputFormat.BOTH
 
 
 class CriticalPath(StrictModel):
-    pattern: str = Field(min_length=1)
+    pattern: RelativePattern
     weight: int = Field(ge=0, le=100)
 
 
 class MappingRule(StrictModel):
-    source: str = Field(min_length=1)
-    tests: list[str] = Field(min_length=1)
+    source: RelativePattern
+    tests: Annotated[list[RelativePattern], Field(min_length=1, max_length=64)]
 
 
 class LanguageConfig(StrictModel):
@@ -112,11 +117,15 @@ class LanguageConfig(StrictModel):
 
 
 class PathsConfig(StrictModel):
-    include: list[str] = Field(default_factory=lambda: ["**/*.py"])
-    exclude: list[str] = Field(
+    include: Annotated[list[RelativePattern], Field(min_length=1, max_length=MAX_PATH_PATTERNS)] = (
+        Field(default_factory=lambda: ["**/*.py"])
+    )
+    exclude: Annotated[list[RelativePattern], Field(max_length=MAX_PATH_PATTERNS)] = Field(
         default_factory=lambda: ["**/migrations/**", "**/generated/**", "**/vendor/**"]
     )
-    test_roots: list[str] = Field(default_factory=lambda: ["tests"])
+    test_roots: Annotated[
+        list[RelativePattern], Field(min_length=1, max_length=MAX_PATH_PATTERNS)
+    ] = Field(default_factory=lambda: ["tests"])
 
 
 class RulesConfig(StrictModel):
@@ -147,9 +156,13 @@ class WeaverConfig(StrictModel):
     version: Literal[1] = 1
     language: LanguageConfig = Field(default_factory=LanguageConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
-    critical_paths: list[CriticalPath] = Field(default_factory=list)
+    critical_paths: Annotated[list[CriticalPath], Field(max_length=MAX_PATH_PATTERNS)] = Field(
+        default_factory=list
+    )
     rules: RulesConfig = Field(default_factory=RulesConfig)
-    mapping: list[MappingRule] = Field(default_factory=list)
+    mapping: Annotated[list[MappingRule], Field(max_length=MAX_PATH_PATTERNS)] = Field(
+        default_factory=list
+    )
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
 
     @model_validator(mode="after")

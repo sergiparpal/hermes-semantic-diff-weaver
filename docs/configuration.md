@@ -47,7 +47,10 @@ only static candidate ranking. YAML is size-bounded and loaded with `safe_load`.
 custom tags, unsupported versions/languages, invalid ranges, duplicate mapping sources, absolute
 patterns, drive paths, NULs, and parent traversal are rejected. Repository-local configuration and
 every file it resolves through must remain inside the repository after symlink resolution; an
-explicitly named external `risk_profile` is the only exception.
+explicitly named external `risk_profile` is the only exception to repository containment. It must
+still remain inside a host-authorized workspace root. The default authorized root is the process
+working directory; trusted operators can provide additional roots through the path-separator-delimited
+`HERMES_SEMANTIC_DIFF_WEAVER_ALLOWED_ROOTS` environment variable.
 
 `privacy.redact_patterns` must remain `true` and `privacy.allow_network` must remain `false`.
 Configured excludes are additive with mandatory control, credential, key, token, cache, environment,
@@ -61,6 +64,15 @@ source is limited to 64 MiB in aggregate. Configured values below those ceilings
 Files omitted by an immutable ceiling are reported explicitly and mark the analysis scope as
 truncated.
 
+AST processing applies tighter independent ceilings before structural matching: 1,000,000 UTF-8
+bytes per file version, 16 MiB of aggregate source, 50,000 nodes and 2,000 symbols per file, 4,000
+retained symbols across the request, bounded similarity candidate windows, and a cooperative
+10-second analysis deadline. Exceeding one produces explicit `ast_resource_limit` scope.
+
 Candidate-test indexing also has non-configurable safety ceilings of 500 test files and 8 MiB of
 aggregate UTF-8 test source. These ceilings cannot be expanded by repository configuration. Reaching
 either one emits a warning and uses `mapping_incomplete` when no candidate is found.
+
+Path-pattern strings are limited to 512 characters. Include, exclude, test-root, critical-path, and
+mapping collections have immutable item-count limits so repository configuration cannot create an
+unbounded glob-matching workload.

@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+
+from hermes_semantic_diff_weaver.path_policy import ALLOWED_ROOTS_ENV
+
+
+@pytest.fixture(autouse=True)
+def authorized_test_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    roots = os.pathsep.join((str(Path.cwd().resolve()), str(tmp_path.resolve())))
+    monkeypatch.setenv(ALLOWED_ROOTS_ENV, roots)
 
 
 def git(repo: Path, *arguments: str) -> str:

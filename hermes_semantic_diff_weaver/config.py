@@ -11,10 +11,13 @@ import yaml
 from pydantic import ValidationError
 
 from .errors import ErrorCode, WeaverError
-from .models import AnalyzeRequest, WeaverConfig
-from .path_policy import ensure_contained
+from .models import MAX_PATTERN_CHARS, AnalyzeRequest, WeaverConfig
+from .path_policy import ensure_authorized_path, ensure_contained
 
 MAX_CONFIG_BYTES = 256 * 1024
+MAX_YAML_EVENTS = 20_000
+MAX_YAML_DEPTH = 50
+MAX_YAML_ALIASES = 100
 
 
 def _configuration_error(message: str) -> WeaverError:
@@ -28,6 +31,10 @@ def _configuration_error(message: str) -> WeaverError:
 def _validate_relative_pattern(value: str, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise _configuration_error(f"{label} must contain non-empty relative patterns.")
+    if len(value) > MAX_PATTERN_CHARS:
+        raise _configuration_error(
+            f"{label} contains a pattern longer than {MAX_PATTERN_CHARS} characters."
+        )
     normalized = value.replace("\\", "/")
     windows = PureWindowsPath(value)
     posix = PurePosixPath(normalized)
@@ -42,7 +49,9 @@ def _validate_config_paths(data: dict[str, Any]) -> None:
     paths = data.get("paths", {})
     if isinstance(paths, dict):
         for field in ("include", "exclude", "test_roots"):
-            values = paths.get(field, []) or []
+            if field not in paths:
+                continue
+            values = paths[field] or []
             if isinstance(values, list):
                 paths[field] = [
                     _validate_relative_pattern(value, f"paths.{field}") for value in values
@@ -74,8 +83,26 @@ def _read_yaml(path: Path, *, containment_root: Path | None = None) -> dict[str,
     if resolved.stat().st_size > MAX_CONFIG_BYTES:
         raise _configuration_error("The configuration file exceeds the 262144-byte limit.")
     try:
-        loaded = yaml.safe_load(resolved.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        content = resolved.read_text(encoding="utf-8")
+        depth = 0
+        aliases = 0
+        for event_count, event in enumerate(yaml.parse(content, Loader=yaml.SafeLoader), start=1):
+            if event_count > MAX_YAML_EVENTS:
+                raise _configuration_error("The YAML configuration exceeds its event limit.")
+            if isinstance(event, (yaml.MappingStartEvent, yaml.SequenceStartEvent)):
+                depth += 1
+                if depth > MAX_YAML_DEPTH:
+                    raise _configuration_error("The YAML configuration exceeds its depth limit.")
+            elif isinstance(event, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
+                depth -= 1
+            elif isinstance(event, yaml.AliasEvent):
+                aliases += 1
+                if aliases > MAX_YAML_ALIASES:
+                    raise _configuration_error("The YAML configuration exceeds its alias limit.")
+        loaded = yaml.safe_load(content)
+    except WeaverError:
+        raise
+    except (MemoryError, OSError, RecursionError, UnicodeError, yaml.YAMLError) as exc:
         raise _configuration_error("The configuration file is not valid safe UTF-8 YAML.") from exc
     if loaded is None:
         return {}
@@ -110,7 +137,7 @@ def load_config(repo_root: Path, request: AnalyzeRequest) -> tuple[WeaverConfig,
     elif local_path.is_file():
         data = _merge(data, _read_yaml(local_path, containment_root=repo_root))
     if request.risk_profile:
-        data = _merge(data, _read_yaml(Path(request.risk_profile)))
+        data = _merge(data, _read_yaml(ensure_authorized_path(Path(request.risk_profile))))
     request_override: dict[str, Any] = {"paths": {}}
     if request.include is not None:
         request_override["paths"]["include"] = [

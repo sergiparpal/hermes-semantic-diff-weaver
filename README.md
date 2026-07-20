@@ -63,6 +63,18 @@ Hermes registers exactly one tool, `analyze_semantic_diff`:
 `json`, `markdown`, or `both`. An optional `risk_profile` may name a bounded YAML file explicitly.
 Unknown arguments are rejected.
 
+Caller-selected local paths are authorized independently of repository containment. By default the
+tool may access only paths below the Hermes process working directory. A trusted host operator can
+authorize additional bounded roots with the platform-path-separator-delimited
+`HERMES_SEMANTIC_DIFF_WEAVER_ALLOWED_ROOTS` environment variable. For example, on Linux/macOS:
+
+```text
+HERMES_SEMANTIC_DIFF_WEAVER_ALLOWED_ROOTS=/work/project:/work/shared-profiles
+```
+
+Both `repo_path` and an external `risk_profile` must resolve below one of these roots. Filesystem
+roots are never accepted as authorization roots.
+
 The handler always returns a JSON-encoded string. JSON mode returns the canonical schema-versioned
 analysis. Markdown mode returns a JSON envelope containing the PR-ready brief. Both mode returns the
 canonical analysis and matching Markdown together.

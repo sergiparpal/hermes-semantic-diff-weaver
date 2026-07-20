@@ -143,7 +143,14 @@ def _batch_payload(items: tuple[dict[str, Any], ...], readme_excerpt: str | None
     document: dict[str, Any] = {"evidence_groups": items}
     if readme_excerpt:
         document["repository_purpose_context"] = readme_excerpt
-    return json.dumps(document, ensure_ascii=False, sort_keys=True)
+    serialized = json.dumps(document, ensure_ascii=False, sort_keys=True)
+    # Keep the framing tokens syntactically unrepresentable inside repository-controlled data.
+    return serialized.replace("&", r"\u0026").replace("<", r"\u003c").replace(">", r"\u003e")
+
+
+def _generated_text(value: str, *, max_chars: int) -> str:
+    """Redact provider prose again before it can enter canonical output."""
+    return redact_text(value, max_chars=max_chars)
 
 
 def _critical_weight(batch: EvidenceBatch, config: WeaverConfig) -> int:
@@ -455,16 +462,28 @@ def interpret_candidates(
                 existing.confidence_baseline = max(
                     existing.confidence_baseline, min(behavior.confidence, 0.98)
                 )
-                existing.assumptions = sorted(set([*existing.assumptions, *behavior.assumptions]))
+                existing.assumptions = sorted(
+                    set(
+                        [
+                            *existing.assumptions,
+                            *(
+                                _generated_text(item, max_chars=1000)
+                                for item in behavior.assumptions
+                            ),
+                        ]
+                    )
+                )
                 accepted = existing
             else:
                 accepted = SemanticCandidate(
                     category=category,
-                    summary=behavior.summary,
-                    observable_impact=behavior.observable_impact,
+                    summary=_generated_text(behavior.summary, max_chars=500),
+                    observable_impact=_generated_text(behavior.observable_impact, max_chars=1000),
                     evidence=evidence,
                     confidence_baseline=min(behavior.confidence, 0.85),
-                    assumptions=behavior.assumptions,
+                    assumptions=[
+                        _generated_text(item, max_chars=1000) for item in behavior.assumptions
+                    ],
                     origin=Origin.LLM_SUPPORTED,
                     rule_ids=["SDW-LLM-SUPPORTED"],
                 )
@@ -486,10 +505,10 @@ def interpret_candidates(
                 SuggestedScenario(
                     evidence_ids=tuple(item.id for item in suggested_candidate.evidence),
                     type=suggestion.type,
-                    title=suggestion.title,
-                    given=suggestion.given,
-                    when=suggestion.when,
-                    then=suggestion.then,
+                    title=_generated_text(suggestion.title, max_chars=300),
+                    given=_generated_text(suggestion.given, max_chars=1000),
+                    when=_generated_text(suggestion.when, max_chars=1000),
+                    then=_generated_text(suggestion.then, max_chars=1000),
                 )
             )
     runtime_omitted = len(batches) - visited_batches

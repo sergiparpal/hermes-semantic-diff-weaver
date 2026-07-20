@@ -33,6 +33,29 @@ def test_untrusted_markdown_path_is_escaped(repo_factory) -> None:
     assert "a\\[1\\]\\.py" in result["markdown"]
 
 
+def test_terminal_and_bidirectional_controls_are_visible(repo_factory) -> None:
+    repo, base, head = repo_factory(
+        {"a.py": "def f(x):\n    return x < 1\n"},
+        {"a.py": "def f(x):\n    return x <= 1\n"},
+    )
+    result = AnalysisResult.model_validate(
+        analyze(
+            {
+                "repo_path": str(repo),
+                "base_ref": base,
+                "head_ref": head,
+                "output_format": "json",
+            }
+        )
+    )
+    result.behavior_changes[0].evidence[0].path = "src/escape\x1b[31m\u202epy"
+    markdown = render_markdown(result)
+    assert "\x1b" not in markdown
+    assert "\u202e" not in markdown
+    assert r"\u001b" in markdown
+    assert r"\u202e" in markdown
+
+
 def test_high_risk_low_configured_confidence_renders_review_question(repo_factory) -> None:
     config = (
         "version: 1\n"

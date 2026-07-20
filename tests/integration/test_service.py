@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+import hermes_semantic_diff_weaver.ast_diff as ast_diff
 import hermes_semantic_diff_weaver.service as service
 from hermes_semantic_diff_weaver.plugin import handle_analyze_semantic_diff
 from hermes_semantic_diff_weaver.service import _read_readme_excerpt, analyze
@@ -130,6 +131,21 @@ def test_parse_failures_retain_bounded_evidence_and_continue(repo_factory) -> No
     assert incomplete["behavior_changes"][0]["category"] == "unknown_semantic_change"
     assert incomplete["behavior_changes"][0]["evidence"][0]["parser_complete"] is False
     assert incomplete["scope"]["truncated"] is True
+
+
+def test_ast_resource_limit_is_explicit_in_scope(repo_factory, monkeypatch) -> None:
+    repo, base, head = repo_factory(
+        {"bounded.py": "def f(x):\n    return x < 2\n"},
+        {"bounded.py": "def f(x):\n    return x <= 2\n"},
+    )
+    monkeypatch.setattr(ast_diff, "MAX_AST_SOURCE_BYTES_PER_VERSION", 1)
+
+    result = analyze(
+        {"repo_path": str(repo), "base_ref": base, "head_ref": head, "output_format": "json"}
+    )
+
+    assert any(item["reason"] == "ast_resource_limit" for item in result["scope"]["omitted"])
+    assert any("immutable AST safety budgets" in item for item in result["limitations"])
 
 
 def test_handler_always_returns_json_on_llm_failure(repo_factory) -> None:

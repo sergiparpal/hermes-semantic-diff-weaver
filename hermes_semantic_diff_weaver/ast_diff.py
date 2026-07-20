@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import time
+from bisect import bisect_left
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -14,14 +16,41 @@ from .git_diff import ChangedFile, Hunk
 from .models import LineRange
 from .path_policy import redact_text
 
+MAX_AST_NODES_PER_FILE = 50_000
+MAX_AST_DEPTH = 200
+MAX_SYMBOLS_PER_FILE = 2_000
+MAX_AST_SOURCE_BYTES_PER_VERSION = 1_000_000
+MAX_AST_SOURCE_BYTES_TOTAL = 16 * 1024 * 1024
+MAX_EXTRACTED_SYMBOLS_TOTAL = 4_000
+AST_ANALYSIS_TIMEOUT_SECONDS = 10.0
+MAX_SIMILARITY_CANDIDATES = 64
+MAX_EXACT_GROUP_COMPARISONS = 4_096
+
+
+class AstResourceLimit(ValueError):
+    """Raised when untrusted source exceeds an immutable structural safety budget."""
+
 
 def _compact(node: ast.AST | None, limit: int = 500) -> str:
     if node is None:
         return "None"
     try:
         return redact_text(ast.unparse(node), max_chars=limit)
-    except (AttributeError, ValueError):
+    except (AttributeError, RecursionError, ValueError):
         return type(node).__name__
+
+
+def _validate_ast_budget(tree: ast.AST) -> None:
+    pending = [(tree, 1)]
+    nodes = 0
+    while pending:
+        node, depth = pending.pop()
+        nodes += 1
+        if nodes > MAX_AST_NODES_PER_FILE:
+            raise AstResourceLimit("AST node budget exceeded")
+        if depth > MAX_AST_DEPTH:
+            raise AstResourceLimit("AST depth budget exceeded")
+        pending.extend((child, depth + 1) for child in ast.iter_child_nodes(node))
 
 
 def _call_name(node: ast.AST) -> str:
@@ -287,7 +316,13 @@ def _snapshot(node: ast.AST, qualified_name: str, kind: str) -> SymbolSnapshot:
 
 def extract_symbols(source: str) -> list[SymbolSnapshot]:
     tree = ast.parse(source, type_comments=True)
+    _validate_ast_budget(tree)
     symbols: list[SymbolSnapshot] = []
+
+    def record(snapshot: SymbolSnapshot) -> None:
+        if len(symbols) >= MAX_SYMBOLS_PER_FILE:
+            raise AstResourceLimit("symbol budget exceeded")
+        symbols.append(snapshot)
 
     def walk(body: list[ast.stmt], prefix: str, *, parent_is_class: bool = False) -> None:
         module_body: list[ast.stmt] = []
@@ -309,7 +344,7 @@ def extract_symbols(source: str) -> list[SymbolSnapshot]:
                 )
                 ast.copy_location(class_shell, statement)
                 class_shell.end_lineno = statement.end_lineno
-                symbols.append(_snapshot(class_shell, name, "class"))
+                record(_snapshot(class_shell, name, "class"))
                 walk(statement.body, name, parent_is_class=True)
             elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 name = f"{prefix}.{statement.name}" if prefix else statement.name
@@ -323,7 +358,7 @@ def extract_symbols(source: str) -> list[SymbolSnapshot]:
                         if isinstance(statement, ast.AsyncFunctionDef)
                         else "function"
                     )
-                symbols.append(_snapshot(statement, name, kind))
+                record(_snapshot(statement, name, kind))
                 nested: list[ast.stmt] = [
                     item
                     for item in statement.body
@@ -337,7 +372,7 @@ def extract_symbols(source: str) -> list[SymbolSnapshot]:
             snapshot = _snapshot(module, "<module>", "module")
             snapshot.start = 1
             snapshot.end = max(1, len(source.splitlines()))
-            symbols.append(snapshot)
+            record(snapshot)
 
     walk(tree.body, "")
     return symbols
@@ -364,6 +399,7 @@ class AstAnalysis:
     parsed_files: int
     failed_files: int
     changed_symbols: int
+    resource_limited_files: int = 0
 
 
 def _overlaps(start: int, end: int, hunk_start: int, hunk_count: int) -> bool:
@@ -682,20 +718,25 @@ def _match_symbols(
         old_group = sorted(old_by_name[name], key=lambda item: item.start)
         new_group = sorted(new_by_name[name], key=lambda item: item.start)
         # Exact definition shapes preserve overloads even when their order changes.
-        for old in old_group:
-            possible = [
-                new
-                for new in new_group
-                if id(new) not in matched_new
-                and old.kind == new.kind
-                and old.signature == new.signature
-                and old.fingerprint == new.fingerprint
-            ]
-            if len(possible) == 1:
-                new = possible[0]
-                pairs.append((old, new))
-                matched_old.add(id(old))
-                matched_new.add(id(new))
+        if len(old_group) * len(new_group) <= MAX_EXACT_GROUP_COMPARISONS:
+            for old in old_group:
+                exact_candidates = [
+                    new
+                    for new in new_group
+                    if id(new) not in matched_new
+                    and old.kind == new.kind
+                    and old.signature == new.signature
+                    and old.fingerprint == new.fingerprint
+                ]
+                if len(exact_candidates) == 1:
+                    new = exact_candidates[0]
+                    pairs.append((old, new))
+                    matched_old.add(id(old))
+                    matched_new.add(id(new))
+        else:
+            warnings.append(
+                f"Large overload-like group for {name!r} was matched conservatively by source order."
+            )
         remaining_old_same = [item for item in old_group if id(item) not in matched_old]
         remaining_new_same = [item for item in new_group if id(item) not in matched_new]
         # Exact qualified names are the authoritative next pass. Source order disambiguates
@@ -723,7 +764,12 @@ def _match_symbols(
     unresolved: list[SymbolSnapshot] = []
     for old in remaining_old:
         key = f"{old.kind}:{old.signature_shape}:{old.fingerprint}"
-        possible = [item for item in candidates.get(key, []) if id(item) not in matched_new]
+        possible: list[SymbolSnapshot] = []
+        for item in candidates.get(key, []):
+            if id(item) not in matched_new:
+                possible.append(item)
+            if len(possible) > MAX_SIMILARITY_CANDIDATES:
+                break
         if len(possible) == 1:
             new = possible[0]
             pairs.append((old, new))
@@ -731,20 +777,34 @@ def _match_symbols(
             matched_new.add(id(new))
         elif len(possible) > 1:
             old.match_ambiguous = True
-            for item in possible:
+            for item in possible[:MAX_SIMILARITY_CANDIDATES]:
                 item.match_ambiguous = True
             warnings.append(
                 f"Ambiguous symbol match for {old.qualified_name!r}; treated conservatively."
             )
         else:
             unresolved.append(old)
+    new_by_kind: dict[str, list[SymbolSnapshot]] = defaultdict(list)
+    starts_by_kind: dict[str, list[int]] = {}
+    for item in remaining_new:
+        new_by_kind[item.kind].append(item)
+    for kind, items in new_by_kind.items():
+        items.sort(key=lambda item: (item.start, item.qualified_name))
+        starts_by_kind[kind] = [item.start for item in items]
+
+    def nearby_candidates(old: SymbolSnapshot) -> list[SymbolSnapshot]:
+        items = new_by_kind.get(old.kind, [])
+        if len(items) <= MAX_SIMILARITY_CANDIDATES:
+            return [item for item in items if id(item) not in matched_new]
+        insertion = bisect_left(starts_by_kind[old.kind], old.start)
+        left = max(0, insertion - MAX_SIMILARITY_CANDIDATES // 2)
+        right = min(len(items), left + MAX_SIMILARITY_CANDIDATES)
+        left = max(0, right - MAX_SIMILARITY_CANDIDATES)
+        return [item for item in items[left:right] if id(item) not in matched_new]
+
     for old in unresolved:
         scored = sorted(
-            (
-                (_symbol_similarity(old, new), new)
-                for new in remaining_new
-                if id(new) not in matched_new
-            ),
+            ((_symbol_similarity(old, new), new) for new in nearby_candidates(old)),
             key=lambda item: (-item[0], item[1].qualified_name, item[1].start),
         )
         plausible = [item for item in scored if item[0] >= 0.82]
@@ -785,19 +845,32 @@ def _match_cross_file_symbols(
     warnings: list[str] = []
     matched_old: set[int] = set()
     matched_new: set[int] = set()
+    by_name: dict[tuple[str, str], list[tuple[SymbolSnapshot, ChangedFile]]] = defaultdict(list)
+    by_fingerprint: dict[tuple[str, str, str], list[tuple[SymbolSnapshot, ChangedFile]]] = (
+        defaultdict(list)
+    )
+    by_shape: dict[tuple[str, str], list[tuple[SymbolSnapshot, ChangedFile]]] = defaultdict(list)
+    for new, new_file in added:
+        by_name[(new.kind, new.qualified_name)].append((new, new_file))
+        by_fingerprint[(new.kind, new.signature_shape, new.fingerprint)].append((new, new_file))
+        by_shape[(new.kind, new.signature_shape)].append((new, new_file))
 
-    def available_added() -> list[tuple[SymbolSnapshot, ChangedFile]]:
-        return [item for item in added if id(item[0]) not in matched_new]
+    def available(
+        items: list[tuple[SymbolSnapshot, ChangedFile]],
+    ) -> list[tuple[SymbolSnapshot, ChangedFile]]:
+        result: list[tuple[SymbolSnapshot, ChangedFile]] = []
+        for item in items:
+            if id(item[0]) not in matched_new:
+                result.append(item)
+            if len(result) > MAX_SIMILARITY_CANDIDATES:
+                break
+        return result
 
     # Preserve exact qualified names across files first, but never force duplicate near-ties.
     for old, old_file in removed:
         if old.kind == "module":
             continue
-        exact = [
-            (new, new_file)
-            for new, new_file in available_added()
-            if new.kind == old.kind and new.qualified_name == old.qualified_name
-        ]
+        exact = available(by_name[(old.kind, old.qualified_name)])
         if len(exact) == 1:
             new, new_file = exact[0]
             pairs.append((old, old_file, new, new_file))
@@ -815,13 +888,7 @@ def _match_cross_file_symbols(
     for old, old_file in removed:
         if id(old) in matched_old or old.kind == "module":
             continue
-        exact = [
-            (new, new_file)
-            for new, new_file in available_added()
-            if new.kind == old.kind
-            and new.signature_shape == old.signature_shape
-            and new.fingerprint == old.fingerprint
-        ]
+        exact = available(by_fingerprint[(old.kind, old.signature_shape, old.fingerprint)])
         if len(exact) == 1:
             new, new_file = exact[0]
             pairs.append((old, old_file, new, new_file))
@@ -839,10 +906,20 @@ def _match_cross_file_symbols(
     for old, old_file in removed:
         if id(old) in matched_old or old.kind == "module":
             continue
+        candidates = available(by_shape[(old.kind, old.signature_shape)])
+        if len(candidates) > MAX_SIMILARITY_CANDIDATES:
+            old.match_ambiguous = True
+            for new, _ in candidates[:MAX_SIMILARITY_CANDIDATES]:
+                new.match_ambiguous = True
+            warnings.append(
+                f"Cross-file similarity candidates for {old.qualified_name!r} exceeded the "
+                "safety cap; treated conservatively."
+            )
+            continue
         scored = sorted(
             (
                 (_symbol_similarity(old, new), new, new_file)
-                for new, new_file in available_added()
+                for new, new_file in candidates
                 if new.kind != "module"
             ),
             key=lambda item: (-item[0], item[2].path, item[1].qualified_name, item[1].start),
@@ -874,22 +951,59 @@ def analyze_ast(files: list[ChangedFile]) -> AstAnalysis:
     warnings: list[str] = []
     parsed_files = 0
     failed_files = 0
+    resource_limited_files = 0
+    retained_source_bytes = 0
+    extracted_symbols = 0
+    deadline = time.monotonic() + AST_ANALYSIS_TIMEOUT_SECONDS
     changed_symbol_keys: set[tuple[str, str]] = set()
     parsed: list[tuple[ChangedFile, list[SymbolSnapshot], list[SymbolSnapshot]]] = []
     for changed in files:
         path = changed.path
         try:
+            sources = [
+                source for source in (changed.old_text, changed.new_text) if source is not None
+            ]
+            source_sizes = [len(source.encode("utf-8")) for source in sources]
+            source_bytes = sum(source_sizes)
+            if time.monotonic() > deadline:
+                raise AstResourceLimit("AST analysis deadline exceeded")
+            if any(size > MAX_AST_SOURCE_BYTES_PER_VERSION for size in source_sizes):
+                raise AstResourceLimit("AST source byte budget exceeded")
+            if retained_source_bytes + source_bytes > MAX_AST_SOURCE_BYTES_TOTAL:
+                raise AstResourceLimit("aggregate AST source byte budget exceeded")
+            retained_source_bytes += source_bytes
             old_symbols = (
                 extract_symbols(changed.old_text)
                 if changed.old_text is not None and not changed.status.startswith("C")
                 else []
             )
             new_symbols = extract_symbols(changed.new_text) if changed.new_text is not None else []
-        except (SyntaxError, ValueError, TypeError):
+            if (
+                extracted_symbols + len(old_symbols) + len(new_symbols)
+                > MAX_EXTRACTED_SYMBOLS_TOTAL
+            ):
+                raise AstResourceLimit("aggregate symbol budget exceeded")
+            extracted_symbols += len(old_symbols) + len(new_symbols)
+        except (
+            AstResourceLimit,
+            MemoryError,
+            RecursionError,
+            SyntaxError,
+            TypeError,
+            ValueError,
+        ) as exc:
             failed_files += 1
-            warnings.append(
-                f"Could not parse changed Python source {path!r}; analysis is incomplete."
-            )
+            resource_limited = isinstance(exc, (AstResourceLimit, MemoryError, RecursionError))
+            if resource_limited:
+                resource_limited_files += 1
+                warnings.append(
+                    f"Changed Python source {path!r} exceeded an immutable AST safety budget; "
+                    "analysis is incomplete."
+                )
+            else:
+                warnings.append(
+                    f"Could not parse changed Python source {path!r}; analysis is incomplete."
+                )
             hunk = changed.hunks[0] if changed.hunks else None
             old_lines = (
                 LineRange(
@@ -912,13 +1026,24 @@ def analyze_ast(files: list[ChangedFile]) -> AstAnalysis:
                     path=path,
                     symbol="<unparsed>",
                     kind="parse_incomplete",
-                    old="Committed Python syntax could not be parsed",
-                    new="Committed Python syntax could not be parsed",
+                    old=(
+                        "Committed Python structure exceeded a safety budget"
+                        if resource_limited
+                        else "Committed Python syntax could not be parsed"
+                    ),
+                    new=(
+                        "Committed Python structure exceeded a safety budget"
+                        if resource_limited
+                        else "Committed Python syntax could not be parsed"
+                    ),
                     old_lines=old_lines,
                     new_lines=new_lines,
                     hunk_id=f"{path}#{hunk.id}" if hunk else None,
                     parser_complete=False,
-                    metadata={"parse_failure": True},
+                    metadata={
+                        "parse_failure": not resource_limited,
+                        "resource_limited": resource_limited,
+                    },
                 )
             )
             changed_symbol_keys.add((path, "<unparsed>"))
@@ -1026,4 +1151,5 @@ def analyze_ast(files: list[ChangedFile]) -> AstAnalysis:
         parsed_files=parsed_files,
         failed_files=failed_files,
         changed_symbols=len(changed_symbol_keys),
+        resource_limited_files=resource_limited_files,
     )

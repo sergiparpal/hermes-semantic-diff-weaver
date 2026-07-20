@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from hermes_semantic_diff_weaver.models import (
+    MAX_PATH_PATTERNS,
     AnalysisResult,
     AnalyzeRequest,
     BehaviorCategory,
@@ -21,6 +22,8 @@ def test_request_defaults_and_unknown_field() -> None:
     assert request.output_format.value == "both"
     with pytest.raises(ValidationError):
         AnalyzeRequest(repo_path=".", base_ref="main", surprise=True)
+    with pytest.raises(ValidationError):
+        AnalyzeRequest(repo_path=".", base_ref="main", include=["a.py"] * (MAX_PATH_PATTERNS + 1))
 
 
 def test_taxonomy_is_exact() -> None:

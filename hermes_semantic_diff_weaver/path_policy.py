@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from .errors import ErrorCode, WeaverError
 
+ALLOWED_ROOTS_ENV = "HERMES_SEMANTIC_DIFF_WEAVER_ALLOWED_ROOTS"
 CONTROL_PARTS = {".git", ".hg", ".svn", ".bzr"}
 CACHE_PARTS = {
     ".cache",
@@ -66,15 +67,46 @@ WINDOWS_RESERVED = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
+SENSITIVE_ASSIGNMENT = re.compile(
+    r"""(?ix)
+    (?P<label>
+        (?<![A-Za-z0-9])
+        [\"']?
+        (?:[A-Za-z0-9]+[_-])*
+        (?:
+            api[_-]?key
+            | access[_-]?token
+            | auth(?:entication|orization)?[_-]?token
+            | authorization
+            | client[_-]?secret
+            | credential(?:s)?
+            | pass(?:word|wd)?
+            | private[_-]?key
+            | secret
+            | token
+        )
+        (?:[_-][A-Za-z0-9]+)*
+        [\"']?
+        \s*[:=]\s*
+    )
+    (?:
+        [rubf]*[\"'][^\"'\r\n]+[\"']
+        | [^\s,}\]]+
+    )
+    """
+)
+CREDENTIAL_URI = re.compile(r"(?i)(?P<label>\b[a-z][a-z0-9+.-]*://[^\s/@:]+:)[^\s/@]+(?=@)")
+AUTHORIZATION_VALUE = re.compile(
+    r"(?i)(?P<label>\b(?:authorization|proxy-authorization)\b\s*[:=]\s*"
+    r"[\"']?(?:basic|bearer)?\s*)[A-Za-z0-9+/_.=-]+"
+)
+BEARER_VALUE = re.compile(r"(?i)(?P<label>\bbearer\s+)[A-Za-z0-9._~+/=-]+")
 REDACTIONS = (
     re.compile(
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:.*?-----END [A-Z ]*PRIVATE KEY-----|.*\Z)",
         re.S,
     ),
     re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,})\b"),
-    re.compile(
-        r"(?i)\b(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*['\"]?[^\s'\"]{8,}"
-    ),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\b(?:xox[baprs]-[A-Za-z0-9-]{20,}|AIza[0-9A-Za-z_-]{30,})\b"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
@@ -118,6 +150,41 @@ def ensure_contained(root: Path, candidate: Path) -> Path:
     except ValueError as exc:
         raise path_error("The resolved path is outside the Git repository.") from exc
     return resolved_candidate
+
+
+def authorized_roots() -> tuple[Path, ...]:
+    """Return host-approved local roots, defaulting securely to the process workspace."""
+    configured = os.environ.get(ALLOWED_ROOTS_ENV)
+    values = configured.split(os.pathsep) if configured is not None else [str(Path.cwd())]
+    roots: list[Path] = []
+    for value in values:
+        if not value:
+            continue
+        try:
+            root = Path(value).resolve(strict=True)
+        except OSError as exc:
+            raise path_error("An authorized workspace root is inaccessible.") from exc
+        if not root.is_dir() or root == Path(root.anchor):
+            raise path_error("An authorized workspace root must be a bounded directory.")
+        roots.append(root)
+    if not roots:
+        raise path_error("No authorized workspace root is configured.")
+    return tuple(dict.fromkeys(roots))
+
+
+def ensure_authorized_path(candidate: Path) -> Path:
+    """Resolve a caller-selected path and require host workspace authorization."""
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise path_error("The requested local path is inaccessible.") from exc
+    for root in authorized_roots():
+        try:
+            resolved.relative_to(root)
+            return resolved
+        except ValueError:
+            continue
+    raise path_error("The requested local path is outside the authorized workspace roots.")
 
 
 def exclusion_reason(path: str) -> str | None:
@@ -197,7 +264,10 @@ def is_included(path: str, includes: list[str], excludes: list[str]) -> bool:
 
 def redact_text(text: str, *, max_chars: int = 2000) -> str:
     """Bound and redact obvious credentials before evidence leaves preprocessing."""
-    redacted = text
+    redacted = CREDENTIAL_URI.sub(lambda match: f"{match.group('label')}[REDACTED]", text)
+    redacted = AUTHORIZATION_VALUE.sub(lambda match: f"{match.group('label')}[REDACTED]", redacted)
+    redacted = BEARER_VALUE.sub(lambda match: f"{match.group('label')}[REDACTED]", redacted)
+    redacted = SENSITIVE_ASSIGNMENT.sub(lambda match: f"{match.group('label')}[REDACTED]", redacted)
     for pattern in REDACTIONS:
         redacted = pattern.sub("[REDACTED]", redacted)
     return redacted[:max_chars]

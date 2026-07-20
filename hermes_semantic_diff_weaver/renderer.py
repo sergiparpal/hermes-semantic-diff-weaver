@@ -3,18 +3,55 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 from .models import AnalysisResult, BothEnvelope, MarkdownEnvelope, OutputFormat
 
+BIDI_CONTROLS = frozenset(
+    {
+        "\u061c",
+        "\u200e",
+        "\u200f",
+        "\u202a",
+        "\u202b",
+        "\u202c",
+        "\u202d",
+        "\u202e",
+        "\u2066",
+        "\u2067",
+        "\u2068",
+        "\u2069",
+    }
+)
+
+
+def _visible_controls(text: str, *, preserve_newlines: bool = False) -> str:
+    output: list[str] = []
+    for character in text:
+        if character == "\n" and preserve_newlines:
+            output.append(character)
+        elif character == "\r":
+            output.append("\\r")
+        elif character == "\n":
+            output.append("\\n")
+        elif character == "\t":
+            output.append("\\t")
+        elif unicodedata.category(character) == "Cc" or character in BIDI_CONTROLS:
+            width = 4 if ord(character) <= 0xFFFF else 8
+            output.append(f"\\u{ord(character):0{width}x}")
+        else:
+            output.append(character)
+    return "".join(output)
+
 
 def _escape(text: str) -> str:
-    controlled = text.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+    controlled = _visible_controls(text)
     return re.sub(r"([\\`*_{}\[\]()<>#+.!|~-])", r"\\\1", controlled)
 
 
 def _fenced_summary(label: str, text: str) -> list[str]:
-    safe = text.replace("`", "'").replace("\r", "\\r").replace("\t", "\\t")
+    safe = _visible_controls(text.replace("`", "'"), preserve_newlines=True)
     return [f"    {label}: {line}" for line in safe.splitlines() or [""]]
 
 

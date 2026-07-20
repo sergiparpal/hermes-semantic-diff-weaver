@@ -70,3 +70,16 @@ def test_invalid_and_excess_per_behavior_obligations_are_discarded() -> None:
     assert len(result.suggestions) == 6
     assert any("per-behavior cap" in item for item in result.warnings)
     assert any("invalid behavior index" in item for item in result.warnings)
+
+
+def test_provider_generated_prose_is_redacted_before_output() -> None:
+    payload = valid_payload()
+    payload["behaviors"][0]["assumptions"] = ["CLIENT_SECRET = 'provider-secret-value-123456'"]
+    payload["obligations"][0]["title"] = "Bearer provider-token-value-123456"
+    result = interpret_candidates([candidate()], FakeLlm([Result("json", payload)]), WeaverConfig())
+    combined = " ".join(
+        [*result.candidates[0].assumptions, *(item.title for item in result.suggestions)]
+    )
+    assert "provider-secret-value" not in combined
+    assert "provider-token-value" not in combined
+    assert "[REDACTED]" in combined
