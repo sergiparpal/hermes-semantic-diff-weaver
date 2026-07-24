@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
-from ..git_diff import ChangedFile
+from ..git_diff import ChangedFile, Hunk
 from ..models import LineRange
 from .compare import compare_symbol
 from .extract import AstResourceLimit, extract_symbols
@@ -12,13 +13,13 @@ from .match import match_cross_file_symbols, match_symbols
 from .types import AstAnalysis, StructuralDelta, SymbolSnapshot
 
 
-def _ast_api():
+def _ast_api() -> Any:
     from hermes_semantic_diff_weaver import ast_diff as api
 
     return api
 
 
-def _hunk_line_range(hunk, *, side: str) -> LineRange | None:
+def _hunk_line_range(hunk: Hunk | None, *, side: str) -> LineRange | None:
     if hunk is None:
         return None
     if side == "old":

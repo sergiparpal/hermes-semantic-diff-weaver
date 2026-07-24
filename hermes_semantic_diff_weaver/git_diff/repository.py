@@ -6,7 +6,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Literal, overload
+from typing import Any, Literal, overload
 
 from ..errors import ErrorCode, WeaverError
 from ..path_policy import normalize_repo_path
@@ -18,7 +18,7 @@ def _git_error(code: ErrorCode, message: str, remediation: str) -> WeaverError:
     return WeaverError(code, message, remediation)
 
 
-def _git_diff_api():
+def _git_diff_api() -> Any:
     """Resolve the public package so tests can monkeypatch facade attributes."""
     from hermes_semantic_diff_weaver import git_diff as api
 

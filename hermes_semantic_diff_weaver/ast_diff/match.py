@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from difflib import SequenceMatcher
 from typing import TypeVar
 
@@ -75,7 +75,7 @@ def mark_ambiguous(
 
 
 def pick_unique_match(
-    scored: list[tuple[float, T]],
+    scored: Sequence[tuple[float, T]],
     *,
     accept: float = limits.SIMILARITY_ACCEPT_THRESHOLD,
     tie_margin: float = limits.SIMILARITY_TIE_MARGIN,

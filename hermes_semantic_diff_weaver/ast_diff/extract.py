@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 from collections import Counter
+from typing import Any
 
 from ..path_policy import redact_text
 from . import limits
@@ -39,7 +40,7 @@ def _validate_ast_budget(tree: ast.AST) -> None:
         pending.extend((child, depth + 1) for child in ast.iter_child_nodes(node))
 
 
-def _ast_api():
+def _ast_api() -> Any:
     from hermes_semantic_diff_weaver import ast_diff as api
 
     return api
