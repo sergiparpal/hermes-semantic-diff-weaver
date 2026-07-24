@@ -5,13 +5,15 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 OVERALL_MINIMUM = 85.0
 BRANCH_MINIMUM = 90.0
+# File paths end with ".py"; package paths end with "/" and aggregate member coverage.
 CRITICAL_MODULES = (
     "config.py",
     "errors.py",
-    "git_diff.py",
+    "git_diff/",
     "obligations.py",
     "path_policy.py",
     "plugin.py",
@@ -21,6 +23,35 @@ CRITICAL_MODULES = (
     "service.py",
     "test_mapper.py",
 )
+
+
+def _normalize(path: str) -> str:
+    return path.replace("\\", "/")
+
+
+def _matching_summaries(files: dict[str, Any], module: str) -> list[dict[str, Any]]:
+    target = _normalize(module)
+    matches: list[dict[str, Any]] = []
+    for path, value in files.items():
+        normalized = _normalize(path)
+        if target.endswith("/"):
+            package = target.strip("/")
+            if f"/{package}/" in f"/{normalized}" or normalized.endswith(f"/{package}"):
+                matches.append(value["summary"])
+        elif normalized.endswith(f"/{target}"):
+            matches.append(value["summary"])
+    return matches
+
+
+def _branch_coverage(summaries: list[dict[str, Any]]) -> float:
+    covered = sum(int(item.get("covered_branches", 0)) for item in summaries)
+    total = sum(int(item.get("num_branches", 0)) for item in summaries)
+    if total == 0:
+        # Fall back to the reported percentage when branch data is absent (synthetic tests).
+        if not summaries:
+            return 0.0
+        return float(summaries[0].get("percent_branches_covered", 0.0))
+    return 100.0 * covered / total
 
 
 def main() -> int:
@@ -35,13 +66,15 @@ def main() -> int:
         failures.append(f"overall coverage {overall:.2f}% is below {OVERALL_MINIMUM:.0f}%")
     files = report["files"]
     for module in CRITICAL_MODULES:
-        matches = [
-            value for path, value in files.items() if path.replace("\\", "/").endswith(f"/{module}")
-        ]
-        if len(matches) != 1:
+        matches = _matching_summaries(files, module)
+        if module.endswith("/"):
+            if not matches:
+                failures.append(f"critical package {module} is missing in the report")
+                continue
+        elif len(matches) != 1:
             failures.append(f"critical module {module} is missing or duplicated in the report")
             continue
-        branches = float(matches[0]["summary"]["percent_branches_covered"])
+        branches = _branch_coverage(matches)
         if branches < BRANCH_MINIMUM:
             failures.append(
                 f"{module} branch coverage {branches:.2f}% is below {BRANCH_MINIMUM:.0f}%"
