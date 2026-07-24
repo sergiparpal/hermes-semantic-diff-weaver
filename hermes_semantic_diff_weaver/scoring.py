@@ -10,7 +10,7 @@ from .models import (
     ScoreExplanation,
     WeaverConfig,
 )
-from .path_policy import glob_matches
+from .path_policy import critical_weight
 from .semantic_candidates import SemanticCandidate
 
 IMPACT = {
@@ -78,14 +78,7 @@ def score_risk(
     impact = IMPACT[candidate.category]
     if candidate.symbol.rsplit(".", 1)[-1].startswith("_"):
         impact = max(0, impact - 8)
-    critical = max(
-        (
-            item.weight
-            for item in config.critical_paths
-            if glob_matches(candidate.path, item.pattern)
-        ),
-        default=10,
-    )
+    critical = critical_weight(candidate.path, config.critical_paths, default=10)
     if not candidate_tests:
         test_gap = 90
     elif max(item.match_score for item in candidate_tests) < 0.60:

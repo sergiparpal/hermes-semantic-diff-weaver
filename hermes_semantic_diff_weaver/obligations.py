@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -18,9 +17,15 @@ from .models import (
     WeaverConfig,
 )
 from .scoring import obligation_priority
+from .textutil import canonical_phrase
 
 if TYPE_CHECKING:
     from .semantic_interpreter import SuggestedScenario
+
+TEST_GAP_WITH_CANDIDATES = 60
+TEST_GAP_WITHOUT_CANDIDATES = 90
+LLM_SCENARIO_RELEVANCE = 85
+REVIEW_SCENARIO_RELEVANCE = 80
 
 
 @dataclass(frozen=True)
@@ -276,10 +281,6 @@ TEMPLATES: dict[BehaviorCategory, tuple[Scenario, ...]] = {
 }
 
 
-def _normal(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
-
-
 def _merge_candidate_tests(
     current: list[CandidateTest], incoming: list[CandidateTest]
 ) -> list[CandidateTest]:
@@ -317,7 +318,7 @@ def generate_obligations(
     for behavior in behaviors:
         candidates = candidate_tests.get(behavior.id, [])
         coverage = _coverage_status(candidates, mapping_incomplete)
-        gap = 60 if candidates else 90
+        gap = TEST_GAP_WITH_CANDIDATES if candidates else TEST_GAP_WITHOUT_CANDIDATES
         scenarios: tuple[Scenario, ...] = TEMPLATES[behavior.category]
         behavior_evidence_ids = {item.id for item in behavior.evidence}
         supported_suggestions = [
@@ -327,7 +328,7 @@ def generate_obligations(
                 item.given,
                 item.when,
                 item.then,
-                85,
+                LLM_SCENARIO_RELEVANCE,
                 Origin.LLM_SUPPORTED,
             )
             for item in (llm_suggestions or [])
@@ -344,15 +345,15 @@ def generate_obligations(
                     "The missing assumptions and external contract are available",
                     "The inferred behavior change is reviewed",
                     "The intended observable outcome is confirmed and captured by a regression test",
-                    80,
+                    REVIEW_SCENARIO_RELEVANCE,
                 ),
                 *scenarios[: max(0, config.rules.max_obligations_per_behavior - 1)],
             )
         for scenario in scenarios:
             key = (
-                _normal(scenario.given),
-                _normal(scenario.when),
-                _normal(scenario.then),
+                canonical_phrase(scenario.given),
+                canonical_phrase(scenario.when),
+                canonical_phrase(scenario.then),
             )
             priority = obligation_priority(
                 behavior.risk_score, scenario.relevance, gap, behavior.confidence

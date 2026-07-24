@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import re
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -13,7 +13,7 @@ from pydantic import ValidationError
 from .ast_diff import StructuralDelta, analyze_ast
 from .config import load_config
 from .errors import ErrorCode, WeaverError
-from .git_diff import GitRepository, collect_diff
+from .git_diff import DiffCollection, GitRepository, collect_diff
 from .models import (
     AnalysisResult,
     AnalyzeRequest,
@@ -29,12 +29,33 @@ from .models import (
     WeaverConfig,
 )
 from .obligations import generate_obligations
-from .path_policy import ensure_authorized_path, exclusion_reason, glob_matches, redact_text
+from .path_policy import (
+    critical_weight,
+    ensure_authorized_path,
+    exclusion_reason,
+    glob_matches,
+    redact_text,
+)
 from .renderer import render_transport
 from .scoring import confidence_score, score_risk
 from .semantic_candidates import SemanticCandidate, build_candidates
-from .semantic_interpreter import interpret_candidates
+from .semantic_interpreter import InterpreterResult, interpret_candidates
 from .test_mapper import TestIndex, build_test_index, map_candidate_tests
+from .textutil import canonical_phrase
+
+HIGH_IMPACT_DELTA_KINDS = {
+    "signature_change",
+    "comparison_change",
+    "raise_change",
+    "call_change",
+}
+README_NAMES = frozenset({"readme", "readme.md", "readme.rst", "readme.txt"})
+INCOMPLETE_EXCLUSION_REASONS = (
+    "aggregate_source_limit",
+    "binary",
+    "oversized_or_non_utf8",
+    "symlink_or_gitlink",
+)
 
 
 def _validation_error(exc: ValidationError) -> WeaverError:
@@ -55,24 +76,8 @@ def _prioritize_deltas(
     ordered = sorted(
         grouped.items(),
         key=lambda item: (
-            -max(
-                (
-                    critical.weight
-                    for critical in config.critical_paths
-                    if glob_matches(item[0][0], critical.pattern)
-                ),
-                default=0,
-            ),
-            -sum(
-                delta.kind
-                in {
-                    "signature_change",
-                    "comparison_change",
-                    "raise_change",
-                    "call_change",
-                }
-                for delta in item[1]
-            ),
+            -critical_weight(item[0][0], config.critical_paths),
+            -sum(delta.kind in HIGH_IMPACT_DELTA_KINDS for delta in item[1]),
             item[0],
         ),
     )
@@ -94,8 +99,7 @@ def _read_readme_excerpt(repo: GitRepository, head_commit: str, config: WeaverCo
             if "/" not in path
             and not exclusion_reason(path)
             and not any(glob_matches(path, pattern) for pattern in config.paths.exclude)
-            if path.rsplit("/", 1)[-1].casefold()
-            in {"readme", "readme.md", "readme.rst", "readme.txt"}
+            if path.rsplit("/", 1)[-1].casefold() in README_NAMES
         ),
         None,
     )
@@ -113,10 +117,6 @@ def _read_readme_excerpt(repo: GitRepository, head_commit: str, config: WeaverCo
 
 def _deduplicate_candidates(candidates: list[SemanticCandidate]) -> list[SemanticCandidate]:
     output: list[SemanticCandidate] = []
-
-    def normalized(text: str) -> str:
-        return re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
-
     for candidate in candidates:
         candidate_evidence = {item.id for item in candidate.evidence}
         existing = next(
@@ -128,7 +128,8 @@ def _deduplicate_candidates(candidates: list[SemanticCandidate]) -> list[Semanti
                 and item.category is candidate.category
                 and (
                     candidate_evidence & {evidence.id for evidence in item.evidence}
-                    or normalized(item.observable_impact) == normalized(candidate.observable_impact)
+                    or canonical_phrase(item.observable_impact)
+                    == canonical_phrase(candidate.observable_impact)
                 )
             ),
             None,
@@ -153,8 +154,9 @@ def _deduplicate_candidates(candidates: list[SemanticCandidate]) -> list[Semanti
     return output
 
 
-def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
-    """Analyze committed Python changes and return the requested transport dictionary."""
+def _bootstrap(
+    arguments: dict[str, Any],
+) -> tuple[AnalyzeRequest, GitRepository, str, str, WeaverConfig, list[str]]:
     try:
         request = AnalyzeRequest.model_validate(arguments)
     except ValidationError as exc:
@@ -165,18 +167,23 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
     base_commit = repo.resolve_ref(request.base_ref)
     head_commit = repo.resolve_ref(request.head_ref)
     config, config_warnings = load_config(repo.root, request)
-    collection = collect_diff(repo, base_commit, head_commit, config)
-    ast_result = analyze_ast(collection.files)
+    return request, repo, base_commit, head_commit, config, config_warnings
+
+
+def _record_omitted(omitted: list[OmittedScope], reason: str, count: int) -> None:
+    if count:
+        omitted.append(OmittedScope(reason=reason, count=count))
+
+
+def _collect_scope(
+    collection: DiffCollection,
+    ast_result: Any,
+    config: WeaverConfig,
+) -> tuple[list[StructuralDelta], int, list[OmittedScope], bool, bool, int]:
     incomplete_exclusions = sum(
-        collection.excluded_counts.get(reason, 0)
-        for reason in (
-            "aggregate_source_limit",
-            "binary",
-            "oversized_or_non_utf8",
-            "symlink_or_gitlink",
-        )
+        collection.excluded_counts.get(reason, 0) for reason in INCOMPLETE_EXCLUSION_REASONS
     )
-    omitted = [
+    omitted: list[OmittedScope] = [
         OmittedScope(reason=reason, count=count)
         for reason, count in sorted(collection.omitted_counts.items())
         if count
@@ -185,55 +192,39 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
     confidence_truncated = collection.truncated or bool(incomplete_exclusions)
     syntax_failed_files = ast_result.failed_files - ast_result.resource_limited_files
     if syntax_failed_files:
-        omitted.append(OmittedScope(reason="parse_incomplete_files", count=syntax_failed_files))
+        _record_omitted(omitted, "parse_incomplete_files", syntax_failed_files)
         scope_truncated = True
     if ast_result.resource_limited_files:
-        omitted.append(
-            OmittedScope(reason="ast_resource_limit", count=ast_result.resource_limited_files)
-        )
+        _record_omitted(omitted, "ast_resource_limit", ast_result.resource_limited_files)
         scope_truncated = True
     deltas = ast_result.deltas
     changed_symbols = ast_result.changed_symbols
     if changed_symbols > config.rules.max_changed_symbols:
         deltas, omitted_count = _prioritize_deltas(deltas, config.rules.max_changed_symbols, config)
-        omitted.append(OmittedScope(reason="changed_symbol_limit", count=omitted_count))
+        _record_omitted(omitted, "changed_symbol_limit", omitted_count)
         changed_symbols = config.rules.max_changed_symbols
         scope_truncated = True
         confidence_truncated = True
-    deterministic = build_candidates(deltas, config)
-    readme_excerpt = (
-        _read_readme_excerpt(repo, head_commit, config)
-        if deterministic and llm is not None and config.rules.max_llm_calls
-        else None
+    return (
+        deltas,
+        changed_symbols,
+        omitted,
+        scope_truncated,
+        confidence_truncated,
+        incomplete_exclusions,
     )
-    interpreted = interpret_candidates(
-        deterministic,
-        llm,
-        config,
-        readme_excerpt=readme_excerpt,
-    )
-    if interpreted.omitted_batches:
-        omitted.append(OmittedScope(reason="llm_batch_limit", count=interpreted.omitted_batches))
-        scope_truncated = True
-        confidence_truncated = True
-    if interpreted.truncated_evidence_symbols:
-        omitted.append(
-            OmittedScope(
-                reason="model_evidence_limit",
-                count=interpreted.truncated_evidence_symbols,
-            )
-        )
-        scope_truncated = True
-        confidence_truncated = True
-    candidates = _deduplicate_candidates(interpreted.candidates)
+
+
+def _filter_reportable(
+    candidates: list[SemanticCandidate],
+    config: WeaverConfig,
+    *,
+    confidence_truncated: bool,
+) -> tuple[list[SemanticCandidate], dict[int, float], int, int, list[str], list[OmittedScope]]:
     reportable: list[SemanticCandidate] = []
     confidence_by_index: dict[int, float] = {}
-    warnings = [
-        *config_warnings,
-        *collection.warnings,
-        *ast_result.warnings,
-        *interpreted.warnings,
-    ]
+    warnings: list[str] = []
+    omitted: list[OmittedScope] = []
     low_confidence_omitted = 0
     refactors_omitted = 0
     for candidate in candidates:
@@ -253,20 +244,30 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
         warnings.append(
             f"Moved {low_confidence_omitted} finding(s) below the minimum confidence into limitations."
         )
-        omitted.append(OmittedScope(reason="minimum_confidence", count=low_confidence_omitted))
+        _record_omitted(omitted, "minimum_confidence", low_confidence_omitted)
     if refactors_omitted:
-        omitted.append(OmittedScope(reason="low_risk_refactor_policy", count=refactors_omitted))
-    test_index = (
-        build_test_index(repo, head_commit, config)
-        if reportable and config.rules.max_candidate_tests_per_obligation
-        else TestIndex(tests=[], incomplete=False, warnings=[])
+        _record_omitted(omitted, "low_risk_refactor_policy", refactors_omitted)
+    return (
+        reportable,
+        confidence_by_index,
+        low_confidence_omitted,
+        refactors_omitted,
+        warnings,
+        omitted,
     )
-    warnings.extend(test_index.warnings)
-    mapped_by_index = map_candidate_tests(reportable, test_index, config)
+
+
+def _materialize_behaviors(
+    reportable: list[SemanticCandidate],
+    confidence_by_index: dict[int, float],
+    mapped_by_index: dict[int, list[Any]],
+    config: WeaverConfig,
+    *,
+    fallback_mode: bool,
+    partial_fallback: bool,
+) -> tuple[list[BehaviorChange], dict[str, list[Any]]]:
     behaviors: list[BehaviorChange] = []
     tests_by_behavior: dict[str, list[Any]] = {}
-    fallback_mode = not interpreted.status.available
-    partial_fallback = bool(interpreted.status.failures or interpreted.omitted_batches)
     for index, candidate in enumerate(reportable, start=1):
         candidate_tests = mapped_by_index.get(index - 1, [])
         risk_score, risk, explanation = score_risk(candidate, candidate_tests, config)
@@ -296,18 +297,16 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
         )
         behaviors.append(behavior)
         tests_by_behavior[behavior.id] = candidate_tests
-    obligations, omitted_obligations = generate_obligations(
-        behaviors,
-        tests_by_behavior,
-        test_index.incomplete,
-        config,
-        interpreted.suggestions,
-    )
-    if omitted_obligations:
-        omitted.append(OmittedScope(reason="global_obligation_limit", count=omitted_obligations))
-        warnings.append(
-            f"Omitted {omitted_obligations} lower-priority obligation(s) due to the global cap."
-        )
+    return behaviors, tests_by_behavior
+
+
+def _summary_metrics(
+    behaviors: list[BehaviorChange],
+    obligations: list[Any],
+    *,
+    scope_truncated: bool,
+    failed_files: int,
+) -> tuple[RiskLabel, int, float, dict[RiskLabel, int]]:
     if behaviors:
         highest = max(behaviors, key=lambda item: item.risk_score)
         overall_risk = highest.risk
@@ -326,52 +325,175 @@ def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
     else:
         overall_risk = RiskLabel.LOW
         overall_score = 0
-        overall_confidence = 0.0 if scope_truncated or ast_result.failed_files else 1.0
+        overall_confidence = 0.0 if scope_truncated or failed_files else 1.0
     risk_counts = {label: 0 for label in RiskLabel}
     for behavior in behaviors:
         risk_counts[behavior.risk] += 1
+    return overall_risk, overall_score, overall_confidence, risk_counts
+
+
+def _build_limitations(
+    *,
+    collection: DiffCollection,
+    ast_result: Any,
+    incomplete_exclusions: int,
+    low_confidence_omitted: int,
+    interpreted: InterpreterResult,
+    fallback_mode: bool,
+    partial_fallback: bool,
+    deterministic: list[SemanticCandidate],
+) -> list[str]:
     limitations = [
         "Candidate test mapping is static and does not prove runtime coverage.",
         "Only committed Python source at the resolved refs was inspected.",
         "Repository code and tests were not imported, executed, built, installed, or modified.",
     ]
-    if not collection.files:
-        limitations.append("The bounded diff contained no included changed Python source.")
-    elif not ast_result.deltas:
-        limitations.append(
-            "The included Python change contained no reportable behavior-bearing structural delta."
-        )
-    if low_confidence_omitted:
-        limitations.append(
-            f"{low_confidence_omitted} low-confidence finding(s) were not presented as facts."
-        )
-    if ast_result.failed_files:
-        limitations.append(
-            f"{ast_result.failed_files} changed Python file(s) had incomplete parser context."
-        )
-    if ast_result.resource_limited_files:
-        limitations.append(
+    rules: list[tuple[Callable[[], bool], str]] = [
+        (
+            lambda: not collection.files,
+            "The bounded diff contained no included changed Python source.",
+        ),
+        (
+            lambda: bool(collection.files) and not ast_result.deltas,
+            "The included Python change contained no reportable behavior-bearing structural delta.",
+        ),
+        (
+            lambda: bool(low_confidence_omitted),
+            f"{low_confidence_omitted} low-confidence finding(s) were not presented as facts.",
+        ),
+        (
+            lambda: bool(ast_result.failed_files),
+            f"{ast_result.failed_files} changed Python file(s) had incomplete parser context.",
+        ),
+        (
+            lambda: bool(ast_result.resource_limited_files),
             f"{ast_result.resource_limited_files} changed Python file(s) exceeded immutable AST "
-            "safety budgets."
-        )
-    if incomplete_exclusions:
-        limitations.append(
+            "safety budgets.",
+        ),
+        (
+            lambda: bool(incomplete_exclusions),
             f"{incomplete_exclusions} included Python file(s) could not be inspected within "
-            "the immutable source-safety bounds."
-        )
-    if collection.truncated:
-        limitations.append(
-            "Only prioritized critical-path scope was analyzed due to resource limits."
-        )
-    if interpreted.omitted_batches or interpreted.truncated_evidence_symbols:
-        limitations.append("Some optional model interpretation context was omitted or truncated.")
-    if fallback_mode and deterministic:
-        limitations.append("LLM interpretation was unavailable; deterministic fallback was used.")
-    elif partial_fallback:
-        limitations.append(
+            "the immutable source-safety bounds.",
+        ),
+        (
+            lambda: collection.truncated,
+            "Only prioritized critical-path scope was analyzed due to resource limits.",
+        ),
+        (
+            lambda: bool(interpreted.omitted_batches or interpreted.truncated_evidence_symbols),
+            "Some optional model interpretation context was omitted or truncated.",
+        ),
+        (
+            lambda: fallback_mode and bool(deterministic),
+            "LLM interpretation was unavailable; deterministic fallback was used.",
+        ),
+        (
+            lambda: (not fallback_mode) and partial_fallback,
             "LLM interpretation was partial; deterministic fallback was retained for uncovered "
-            "evidence."
+            "evidence.",
+        ),
+    ]
+    for predicate, message in rules:
+        if predicate():
+            limitations.append(message)
+    return limitations
+
+
+def analyze(arguments: dict[str, Any], *, llm: Any = None) -> dict[str, Any]:
+    """Analyze committed Python changes and return the requested transport dictionary."""
+    request, repo, base_commit, head_commit, config, config_warnings = _bootstrap(arguments)
+    collection = collect_diff(repo, base_commit, head_commit, config)
+    ast_result = analyze_ast(collection.files)
+    (
+        deltas,
+        changed_symbols,
+        omitted,
+        scope_truncated,
+        confidence_truncated,
+        incomplete_exclusions,
+    ) = _collect_scope(collection, ast_result, config)
+    deterministic = build_candidates(deltas, config)
+    readme_excerpt = (
+        _read_readme_excerpt(repo, head_commit, config)
+        if deterministic and llm is not None and config.rules.max_llm_calls
+        else None
+    )
+    interpreted = interpret_candidates(
+        deterministic,
+        llm,
+        config,
+        readme_excerpt=readme_excerpt,
+    )
+    if interpreted.omitted_batches:
+        _record_omitted(omitted, "llm_batch_limit", interpreted.omitted_batches)
+        scope_truncated = True
+        confidence_truncated = True
+    if interpreted.truncated_evidence_symbols:
+        _record_omitted(omitted, "model_evidence_limit", interpreted.truncated_evidence_symbols)
+        scope_truncated = True
+        confidence_truncated = True
+    candidates = _deduplicate_candidates(interpreted.candidates)
+    (
+        reportable,
+        confidence_by_index,
+        low_confidence_omitted,
+        _refactors_omitted,
+        filter_warnings,
+        filter_omitted,
+    ) = _filter_reportable(candidates, config, confidence_truncated=confidence_truncated)
+    omitted.extend(filter_omitted)
+    warnings = [
+        *config_warnings,
+        *collection.warnings,
+        *ast_result.warnings,
+        *interpreted.warnings,
+        *filter_warnings,
+    ]
+    test_index = (
+        build_test_index(repo, head_commit, config)
+        if reportable and config.rules.max_candidate_tests_per_obligation
+        else TestIndex(tests=[], incomplete=False, warnings=[])
+    )
+    warnings.extend(test_index.warnings)
+    mapped_by_index = map_candidate_tests(reportable, test_index, config)
+    fallback_mode = not interpreted.status.available
+    partial_fallback = bool(interpreted.status.failures or interpreted.omitted_batches)
+    behaviors, tests_by_behavior = _materialize_behaviors(
+        reportable,
+        confidence_by_index,
+        mapped_by_index,
+        config,
+        fallback_mode=fallback_mode,
+        partial_fallback=partial_fallback,
+    )
+    obligations, omitted_obligations = generate_obligations(
+        behaviors,
+        tests_by_behavior,
+        test_index.incomplete,
+        config,
+        interpreted.suggestions,
+    )
+    if omitted_obligations:
+        _record_omitted(omitted, "global_obligation_limit", omitted_obligations)
+        warnings.append(
+            f"Omitted {omitted_obligations} lower-priority obligation(s) due to the global cap."
         )
+    overall_risk, overall_score, overall_confidence, risk_counts = _summary_metrics(
+        behaviors,
+        obligations,
+        scope_truncated=scope_truncated,
+        failed_files=ast_result.failed_files,
+    )
+    limitations = _build_limitations(
+        collection=collection,
+        ast_result=ast_result,
+        incomplete_exclusions=incomplete_exclusions,
+        low_confidence_omitted=low_confidence_omitted,
+        interpreted=interpreted,
+        fallback_mode=fallback_mode,
+        partial_fallback=partial_fallback,
+        deterministic=deterministic,
+    )
     analysis = AnalysisResult(
         analysis_id=f"sdw_{uuid4().hex}",
         repository=RepositoryIdentity(

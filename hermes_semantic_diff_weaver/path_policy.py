@@ -5,7 +5,9 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any
 
 from .errors import ErrorCode, WeaverError
 
@@ -260,6 +262,22 @@ def is_included(path: str, includes: list[str], excludes: list[str]) -> bool:
     return any(glob_matches(path, item) for item in includes) and not any(
         glob_matches(path, item) for item in excludes
     )
+
+
+def critical_weight(path: str, critical_paths: list[Any], *, default: int = 0) -> int:
+    """Return the highest configured critical-path weight matching a repository path."""
+    return max(
+        (item.weight for item in critical_paths if glob_matches(path, item.pattern)),
+        default=default,
+    )
+
+
+def first_exclusion(paths: Iterable[str | None]) -> str | None:
+    """Return the first mandatory exclusion reason among candidate paths."""
+    for path in paths:
+        if path and (reason := exclusion_reason(path)):
+            return reason
+    return None
 
 
 def redact_text(text: str, *, max_chars: int = 2000) -> str:

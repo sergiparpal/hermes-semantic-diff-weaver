@@ -19,11 +19,16 @@ from .models import (
     Origin,
     WeaverConfig,
 )
-from .path_policy import glob_matches, redact_text
+from .path_policy import critical_weight, redact_text
 from .schemas import LLM_RESPONSE_SCHEMA, LLM_SCHEMA_NAME
 from .semantic_candidates import SemanticCandidate
+from .textutil import getattr_or_key
 
 MAX_LLM_RESPONSE_CHARS = 200_000
+MAX_BEHAVIORS_PER_SYMBOL = 3
+MAX_OBLIGATIONS_PER_BEHAVIOR = 6
+LLM_CONFIDENCE_CAP_EXISTING = 0.98
+LLM_CONFIDENCE_CAP_NEW = 0.85
 UNINFORMATIVE_SHARED_CALLS = {
     "bool",
     "dict",
@@ -71,8 +76,17 @@ class InterpreterResult:
 @dataclass(frozen=True)
 class EvidenceBatch:
     candidates: tuple[SemanticCandidate, ...]
-    payload_items: tuple[dict[str, Any], ...]
+    symbol_payloads: tuple[dict[str, Any], ...]
     evidence_ids: frozenset[str]
+
+    @property
+    def payload_items(self) -> tuple[dict[str, Any], ...]:
+        # Backward-compatible alias used by tests.
+        return self.symbol_payloads
+
+
+def _serialized_size(payload: dict[str, Any]) -> int:
+    return len(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
 def _evidence_payload(
@@ -86,7 +100,7 @@ def _evidence_payload(
         "evidence": evidence,
         "assumptions": candidate.assumptions,
     }
-    if len(json.dumps(payload, ensure_ascii=False, sort_keys=True)) <= limit:
+    if _serialized_size(payload) <= limit:
         return payload, False
     snippet_limit = min(800, max(0, limit // max(4, len(evidence) * 2)))
     compact: list[dict[str, Any]] = []
@@ -112,7 +126,7 @@ def _evidence_payload(
     payload["evidence"] = compact
     payload["truncated"] = True
     payload["omitted_evidence_count"] = 0
-    while len(json.dumps(payload, ensure_ascii=False, sort_keys=True)) > limit and snippet_limit:
+    while _serialized_size(payload) > limit and snippet_limit:
         snippet_limit //= 2
         for record in compact:
             for key in ("old", "new"):
@@ -121,10 +135,10 @@ def _evidence_payload(
                         record[key] = record[key][:snippet_limit]
                     else:
                         record.pop(key)
-    while len(json.dumps(payload, ensure_ascii=False, sort_keys=True)) > limit and len(compact) > 1:
+    while _serialized_size(payload) > limit and len(compact) > 1:
         compact.pop()
         payload["omitted_evidence_count"] += 1
-    if len(json.dumps(payload, ensure_ascii=False, sort_keys=True)) > limit:
+    if _serialized_size(payload) > limit:
         first = compact[0]
         payload = {
             "category_hint": candidate.category.value,
@@ -153,20 +167,14 @@ def _generated_text(value: str, *, max_chars: int) -> str:
     return redact_text(value, max_chars=max_chars)
 
 
-def _critical_weight(batch: EvidenceBatch, config: WeaverConfig) -> int:
+def _batch_critical_weight(batch: EvidenceBatch, config: WeaverConfig) -> int:
     return max(
-        (
-            item.weight
-            for item in config.critical_paths
-            if any(glob_matches(candidate.path, item.pattern) for candidate in batch.candidates)
-        ),
+        (critical_weight(candidate.path, config.critical_paths) for candidate in batch.candidates),
         default=0,
     )
 
 
-def _batch_candidates(
-    candidates: list[SemanticCandidate], config: WeaverConfig
-) -> tuple[list[EvidenceBatch], int, int]:
+def _union_find_groups(candidates: list[SemanticCandidate]) -> list[list[SemanticCandidate]]:
     # Build connected components so same-module symbols and cross-module changes to a shared
     # dependency stay together until the per-call character cap requires a split.
     parents = list(range(len(candidates)))
@@ -198,60 +206,72 @@ def _batch_candidates(
     grouped: dict[int, list[SemanticCandidate]] = defaultdict(list)
     for index, candidate in enumerate(candidates):
         grouped[find(index)].append(candidate)
-    batches: list[EvidenceBatch] = []
-    truncated_symbols = 0
-    oversized_symbols = 0
-    groups = sorted(
+    return sorted(
         grouped.values(),
         key=lambda items: min((item.path, item.symbol, item.category.value) for item in items),
     )
-    for group in groups:
-        current: list[SemanticCandidate] = []
-        current_items: list[dict[str, Any]] = []
-        for candidate in sorted(
-            group, key=lambda item: (item.path, item.symbol, item.category.value)
-        ):
-            item, truncated = _evidence_payload(candidate, config)
-            truncated_symbols += int(truncated)
-            proposed_items = (*current_items, item)
-            payload = _batch_payload(proposed_items)
-            if current and len(_input_text(payload)) > config.rules.max_model_input_chars_per_call:
-                batches.append(
-                    EvidenceBatch(
-                        candidates=tuple(current),
-                        payload_items=tuple(current_items),
-                        evidence_ids=frozenset(
-                            evidence["id"]
-                            for payload_item in current_items
-                            for evidence in payload_item["evidence"]
-                        ),
-                    )
-                )
-                current = []
-                current_items = []
-                payload = _batch_payload((item,))
-            if len(_input_text(payload)) > config.rules.max_model_input_chars_per_call:
-                oversized_symbols += 1
-                continue
-            current.append(candidate)
-            current_items.append(item)
-        if current:
+
+
+def _evidence_ids_from_payloads(payloads: list[dict[str, Any]]) -> frozenset[str]:
+    return frozenset(evidence["id"] for payload in payloads for evidence in payload["evidence"])
+
+
+def _split_group_into_batches(
+    group: list[SemanticCandidate], config: WeaverConfig
+) -> tuple[list[EvidenceBatch], int, int]:
+    batches: list[EvidenceBatch] = []
+    truncated_symbols = 0
+    oversized_symbols = 0
+    current: list[SemanticCandidate] = []
+    current_payloads: list[dict[str, Any]] = []
+    for candidate in sorted(group, key=lambda item: (item.path, item.symbol, item.category.value)):
+        payload, truncated = _evidence_payload(candidate, config)
+        truncated_symbols += int(truncated)
+        proposed = (*current_payloads, payload)
+        encoded = _batch_payload(proposed)
+        if current and len(_input_text(encoded)) > config.rules.max_model_input_chars_per_call:
             batches.append(
                 EvidenceBatch(
                     candidates=tuple(current),
-                    payload_items=tuple(current_items),
-                    evidence_ids=frozenset(
-                        evidence["id"]
-                        for payload_item in current_items
-                        for evidence in payload_item["evidence"]
-                    ),
+                    symbol_payloads=tuple(current_payloads),
+                    evidence_ids=_evidence_ids_from_payloads(current_payloads),
                 )
             )
+            current = []
+            current_payloads = []
+            encoded = _batch_payload((payload,))
+        if len(_input_text(encoded)) > config.rules.max_model_input_chars_per_call:
+            oversized_symbols += 1
+            continue
+        current.append(candidate)
+        current_payloads.append(payload)
+    if current:
+        batches.append(
+            EvidenceBatch(
+                candidates=tuple(current),
+                symbol_payloads=tuple(current_payloads),
+                evidence_ids=_evidence_ids_from_payloads(current_payloads),
+            )
+        )
+    return batches, oversized_symbols, truncated_symbols
+
+
+def _batch_candidates(
+    candidates: list[SemanticCandidate], config: WeaverConfig
+) -> tuple[list[EvidenceBatch], int, int]:
+    batches: list[EvidenceBatch] = []
+    truncated_symbols = 0
+    oversized_symbols = 0
+    for group in _union_find_groups(candidates):
+        group_batches, oversized, truncated = _split_group_into_batches(group, config)
+        batches.extend(group_batches)
+        oversized_symbols += oversized
+        truncated_symbols += truncated
     omitted = max(0, len(batches) - config.rules.max_llm_calls)
     prioritized = sorted(
         batches,
         key=lambda batch: (
-            -_critical_weight(batch, config),
+            -_batch_critical_weight(batch, config),
             -max(item.confidence_baseline for item in batch.candidates),
             batch.candidates[0].path,
         ),
@@ -259,33 +279,19 @@ def _batch_candidates(
     return prioritized, omitted + oversized_symbols, truncated_symbols
 
 
-def _result_value(result: Any, name: str, default: Any = None) -> Any:
-    if isinstance(result, dict):
-        return result.get(name, default)
-    return getattr(result, name, default)
-
-
-def _usage_value(usage: Any, name: str) -> Any:
-    if usage is None:
-        return None
-    if isinstance(usage, dict):
-        return usage.get(name)
-    return getattr(usage, name, None)
-
-
 def _accumulate_usage(current: LlmUsage | None, result: Any) -> LlmUsage | None:
-    usage = _result_value(result, "usage")
+    usage = getattr_or_key(result, "usage")
     if usage is None:
         return current
-    input_tokens = _usage_value(usage, "input_tokens")
+    input_tokens = getattr_or_key(usage, "input_tokens")
     if input_tokens is None:
-        input_tokens = _usage_value(usage, "prompt_tokens")
-    output_tokens = _usage_value(usage, "output_tokens")
+        input_tokens = getattr_or_key(usage, "prompt_tokens")
+    output_tokens = getattr_or_key(usage, "output_tokens")
     if output_tokens is None:
-        output_tokens = _usage_value(usage, "completion_tokens")
-    cost = _usage_value(usage, "cost_usd")
+        output_tokens = getattr_or_key(usage, "completion_tokens")
+    cost = getattr_or_key(usage, "cost_usd")
     if cost is None:
-        cost = _usage_value(usage, "cost")
+        cost = getattr_or_key(usage, "cost")
     if input_tokens is None and output_tokens is None and cost is None:
         return current
     current = current or LlmUsage()
@@ -316,6 +322,165 @@ def _call(llm: Any, payload: str) -> Any:
 
 def _retryable(exc: Exception) -> bool:
     return isinstance(exc, (TimeoutError, ValidationError, ValueError))
+
+
+def _parse_structured_result(result: Any) -> LlmBatchResponse:
+    if getattr_or_key(result, "content_type") != "json" or getattr_or_key(result, "parsed") is None:
+        raise ValueError("structured result unavailable")
+    parsed_value = getattr_or_key(result, "parsed")
+    if isinstance(parsed_value, BaseModel):
+        parsed_value = parsed_value.model_dump(mode="json")
+    encoded = json.dumps(parsed_value, ensure_ascii=False, sort_keys=True)
+    if len(encoded) > MAX_LLM_RESPONSE_CHARS:
+        raise ValueError("structured result exceeded the response limit")
+    return LlmBatchResponse.model_validate(parsed_value)
+
+
+def _invoke_batch(
+    llm: Any,
+    payload: str,
+    *,
+    calls: int,
+    max_calls: int,
+) -> tuple[LlmBatchResponse | None, int, LlmUsage | None, bool]:
+    """Attempt up to two structured calls for one batch. Returns parsed, calls used, usage, schema_fail."""
+    usage: LlmUsage | None = None
+    schema_failure = False
+    attempts = 0
+    used = 0
+    while attempts < 2 and calls + used < max_calls:
+        attempts += 1
+        used += 1
+        try:
+            result = _call(llm, payload)
+            usage = _accumulate_usage(usage, result)
+            return _parse_structured_result(result), used, usage, schema_failure
+        except (TimeoutError, ValidationError, ValueError) as exc:
+            schema_failure |= isinstance(exc, (ValidationError, ValueError))
+            if attempts >= 2 or not _retryable(exc):
+                break
+        except Exception:  # bounded host/provider boundary
+            break
+    return None, used, usage, schema_failure
+
+
+def _accept_behavior(
+    behavior: Any,
+    *,
+    batch: EvidenceBatch,
+    registry: dict[str, Any],
+    batch_categories: dict[str, BehaviorCategory],
+    behavior_counts: dict[str, int],
+    candidates: list[SemanticCandidate],
+    warnings: list[str],
+) -> SemanticCandidate | None:
+    referenced = set(behavior.evidence_ids)
+    if len(referenced) != len(behavior.evidence_ids):
+        warnings.append("Discarded an LLM finding with duplicate evidence references.")
+        return None
+    if not referenced <= registry.keys():
+        warnings.append("Discarded an LLM finding that referenced fabricated evidence.")
+        return None
+    if not referenced <= batch.evidence_ids:
+        warnings.append(
+            "Discarded an LLM finding that referenced evidence outside its supplied batch."
+        )
+        return None
+    evidence = [registry[evidence_id] for evidence_id in behavior.evidence_ids]
+    symbol_key = "|".join(sorted({f"{item.path}:{item.symbol or '<module>'}" for item in evidence}))
+    if behavior_counts[symbol_key] >= MAX_BEHAVIORS_PER_SYMBOL:
+        warnings.append("Discarded an LLM finding above the per-symbol behavior cap.")
+        return None
+    behavior_counts[symbol_key] += 1
+    supported_categories = {batch_categories.get(item.id) for item in evidence}
+    category = behavior.category
+    if category not in supported_categories and category is not BehaviorCategory.UNKNOWN:
+        category = BehaviorCategory.UNKNOWN
+        warnings.append("Downgraded an unsupported LLM category to unknown_semantic_change.")
+    existing = next(
+        (
+            item
+            for item in candidates
+            if item.category is category
+            and {ev.id for ev in item.evidence} == set(behavior.evidence_ids)
+        ),
+        None,
+    )
+    if existing:
+        existing.origin = Origin.LLM_SUPPORTED
+        existing.confidence_baseline = max(
+            existing.confidence_baseline, min(behavior.confidence, LLM_CONFIDENCE_CAP_EXISTING)
+        )
+        existing.assumptions = sorted(
+            set(
+                [
+                    *existing.assumptions,
+                    *(_generated_text(item, max_chars=1000) for item in behavior.assumptions),
+                ]
+            )
+        )
+        return existing
+    accepted = SemanticCandidate(
+        category=category,
+        summary=_generated_text(behavior.summary, max_chars=500),
+        observable_impact=_generated_text(behavior.observable_impact, max_chars=1000),
+        evidence=evidence,
+        confidence_baseline=min(behavior.confidence, LLM_CONFIDENCE_CAP_NEW),
+        assumptions=[_generated_text(item, max_chars=1000) for item in behavior.assumptions],
+        origin=Origin.LLM_SUPPORTED,
+        rule_ids=["SDW-LLM-SUPPORTED"],
+    )
+    candidates.append(accepted)
+    return accepted
+
+
+def _accept_suggestions(
+    parsed: LlmBatchResponse,
+    accepted_for_batch: list[SemanticCandidate | None],
+    warnings: list[str],
+) -> list[SuggestedScenario]:
+    suggestions: list[SuggestedScenario] = []
+    suggestion_counts: defaultdict[int, int] = defaultdict(int)
+    for suggestion in parsed.obligations:
+        if suggestion.behavior_index >= len(accepted_for_batch):
+            warnings.append("Discarded an LLM obligation with an invalid behavior index.")
+            continue
+        suggested_candidate = accepted_for_batch[suggestion.behavior_index]
+        if suggested_candidate is None:
+            continue
+        if suggestion_counts[suggestion.behavior_index] >= MAX_OBLIGATIONS_PER_BEHAVIOR:
+            warnings.append("Discarded an LLM obligation above the per-behavior cap.")
+            continue
+        suggestion_counts[suggestion.behavior_index] += 1
+        suggestions.append(
+            SuggestedScenario(
+                evidence_ids=tuple(item.id for item in suggested_candidate.evidence),
+                type=suggestion.type,
+                title=_generated_text(suggestion.title, max_chars=300),
+                given=_generated_text(suggestion.given, max_chars=1000),
+                when=_generated_text(suggestion.when, max_chars=1000),
+                then=_generated_text(suggestion.then, max_chars=1000),
+            )
+        )
+    return suggestions
+
+
+def _prepare_batch_payload(
+    batch: EvidenceBatch,
+    *,
+    batch_index: int,
+    bounded_readme: str | None,
+    config: WeaverConfig,
+    warnings: list[str],
+) -> str:
+    context = bounded_readme if batch_index == 0 else None
+    payload = _batch_payload(batch.symbol_payloads, context)
+    while context and len(_input_text(payload)) > config.rules.max_model_input_chars_per_call:
+        context = context[: len(context) // 2]
+        payload = _batch_payload(batch.symbol_payloads, context)
+    if bounded_readme and batch_index == 0 and not context:
+        warnings.append("Omitted the README purpose excerpt from model input due to its cap.")
+    return payload
 
 
 def interpret_candidates(
@@ -350,7 +515,7 @@ def interpret_candidates(
     if truncated_symbols:
         warnings.append(f"Truncated bounded model evidence for {truncated_symbols} symbol(s).")
     registry = {item.id: item for candidate in candidates for item in candidate.evidence}
-    output = list(candidates)
+    merged_candidates = list(candidates)
     suggestions: list[SuggestedScenario] = []
     calls = 0
     failures = 0
@@ -367,40 +532,33 @@ def interpret_candidates(
         if calls >= config.rules.max_llm_calls:
             break
         visited_batches += 1
-        context = bounded_readme if batch_index == 0 else None
-        payload = _batch_payload(batch.payload_items, context)
-        while context and len(_input_text(payload)) > config.rules.max_model_input_chars_per_call:
-            context = context[: len(context) // 2]
-            payload = _batch_payload(batch.payload_items, context)
-        if bounded_readme and batch_index == 0 and not context:
-            warnings.append("Omitted the README purpose excerpt from model input due to its cap.")
-        parsed: LlmBatchResponse | None = None
-        attempts = 0
-        while attempts < 2 and calls < config.rules.max_llm_calls:
-            attempts += 1
-            calls += 1
-            try:
-                result = _call(llm, payload)
-                usage = _accumulate_usage(usage, result)
-                if (
-                    _result_value(result, "content_type") != "json"
-                    or _result_value(result, "parsed") is None
-                ):
-                    raise ValueError("structured result unavailable")
-                parsed_value = _result_value(result, "parsed")
-                if isinstance(parsed_value, BaseModel):
-                    parsed_value = parsed_value.model_dump(mode="json")
-                encoded = json.dumps(parsed_value, ensure_ascii=False, sort_keys=True)
-                if len(encoded) > MAX_LLM_RESPONSE_CHARS:
-                    raise ValueError("structured result exceeded the response limit")
-                parsed = LlmBatchResponse.model_validate(parsed_value)
-                break
-            except (TimeoutError, ValidationError, ValueError) as exc:
-                schema_failure_seen |= isinstance(exc, (ValidationError, ValueError))
-                if attempts >= 2 or not _retryable(exc):
-                    break
-            except Exception:  # bounded host/provider boundary
-                break
+        payload = _prepare_batch_payload(
+            batch,
+            batch_index=batch_index,
+            bounded_readme=bounded_readme,
+            config=config,
+            warnings=warnings,
+        )
+        parsed, used, batch_usage, schema_fail = _invoke_batch(
+            llm,
+            payload,
+            calls=calls,
+            max_calls=config.rules.max_llm_calls,
+        )
+        calls += used
+        if batch_usage is not None:
+            usage = LlmUsage(
+                input_tokens=(usage.input_tokens or 0) + (batch_usage.input_tokens or 0)
+                if usage is not None
+                else batch_usage.input_tokens,
+                output_tokens=(usage.output_tokens or 0) + (batch_usage.output_tokens or 0)
+                if usage is not None
+                else batch_usage.output_tokens,
+                cost=(usage.cost or 0.0) + (batch_usage.cost or 0.0)
+                if usage is not None
+                else batch_usage.cost,
+            )
+        schema_failure_seen |= schema_fail
         if parsed is None:
             failures += 1
             warnings.append(
@@ -408,7 +566,6 @@ def interpret_candidates(
             )
             continue
         successes += 1
-        accepted_for_batch: list[SemanticCandidate | None] = []
         batch_categories = {
             evidence.id: candidate.category
             for candidate in batch.candidates
@@ -416,101 +573,20 @@ def interpret_candidates(
             if evidence.id in batch.evidence_ids
         }
         behavior_counts: defaultdict[str, int] = defaultdict(int)
+        accepted_for_batch: list[SemanticCandidate | None] = []
         for behavior in parsed.behaviors:
-            referenced = set(behavior.evidence_ids)
-            if len(referenced) != len(behavior.evidence_ids):
-                warnings.append("Discarded an LLM finding with duplicate evidence references.")
-                accepted_for_batch.append(None)
-                continue
-            if not referenced <= registry.keys():
-                warnings.append("Discarded an LLM finding that referenced fabricated evidence.")
-                accepted_for_batch.append(None)
-                continue
-            if not referenced <= batch.evidence_ids:
-                warnings.append(
-                    "Discarded an LLM finding that referenced evidence outside its supplied batch."
-                )
-                accepted_for_batch.append(None)
-                continue
-            evidence = [registry[evidence_id] for evidence_id in behavior.evidence_ids]
-            symbol_key = "|".join(
-                sorted({f"{item.path}:{item.symbol or '<module>'}" for item in evidence})
-            )
-            if behavior_counts[symbol_key] >= 3:
-                warnings.append("Discarded an LLM finding above the per-symbol behavior cap.")
-                accepted_for_batch.append(None)
-                continue
-            behavior_counts[symbol_key] += 1
-            supported_categories = {batch_categories.get(item.id) for item in evidence}
-            category = behavior.category
-            if category not in supported_categories and category is not BehaviorCategory.UNKNOWN:
-                category = BehaviorCategory.UNKNOWN
-                warnings.append(
-                    "Downgraded an unsupported LLM category to unknown_semantic_change."
-                )
-            existing = next(
-                (
-                    item
-                    for item in output
-                    if item.category is category
-                    and {ev.id for ev in item.evidence} == set(behavior.evidence_ids)
-                ),
-                None,
-            )
-            if existing:
-                existing.origin = Origin.LLM_SUPPORTED
-                existing.confidence_baseline = max(
-                    existing.confidence_baseline, min(behavior.confidence, 0.98)
-                )
-                existing.assumptions = sorted(
-                    set(
-                        [
-                            *existing.assumptions,
-                            *(
-                                _generated_text(item, max_chars=1000)
-                                for item in behavior.assumptions
-                            ),
-                        ]
-                    )
-                )
-                accepted = existing
-            else:
-                accepted = SemanticCandidate(
-                    category=category,
-                    summary=_generated_text(behavior.summary, max_chars=500),
-                    observable_impact=_generated_text(behavior.observable_impact, max_chars=1000),
-                    evidence=evidence,
-                    confidence_baseline=min(behavior.confidence, 0.85),
-                    assumptions=[
-                        _generated_text(item, max_chars=1000) for item in behavior.assumptions
-                    ],
-                    origin=Origin.LLM_SUPPORTED,
-                    rule_ids=["SDW-LLM-SUPPORTED"],
-                )
-                output.append(accepted)
-            accepted_for_batch.append(accepted)
-        suggestion_counts: defaultdict[int, int] = defaultdict(int)
-        for suggestion in parsed.obligations:
-            if suggestion.behavior_index >= len(accepted_for_batch):
-                warnings.append("Discarded an LLM obligation with an invalid behavior index.")
-                continue
-            suggested_candidate = accepted_for_batch[suggestion.behavior_index]
-            if suggested_candidate is None:
-                continue
-            if suggestion_counts[suggestion.behavior_index] >= 6:
-                warnings.append("Discarded an LLM obligation above the per-behavior cap.")
-                continue
-            suggestion_counts[suggestion.behavior_index] += 1
-            suggestions.append(
-                SuggestedScenario(
-                    evidence_ids=tuple(item.id for item in suggested_candidate.evidence),
-                    type=suggestion.type,
-                    title=_generated_text(suggestion.title, max_chars=300),
-                    given=_generated_text(suggestion.given, max_chars=1000),
-                    when=_generated_text(suggestion.when, max_chars=1000),
-                    then=_generated_text(suggestion.then, max_chars=1000),
+            accepted_for_batch.append(
+                _accept_behavior(
+                    behavior,
+                    batch=batch,
+                    registry=registry,
+                    batch_categories=batch_categories,
+                    behavior_counts=behavior_counts,
+                    candidates=merged_candidates,
+                    warnings=warnings,
                 )
             )
+        suggestions.extend(_accept_suggestions(parsed, accepted_for_batch, warnings))
     runtime_omitted = len(batches) - visited_batches
     if runtime_omitted:
         omitted_batches += runtime_omitted
@@ -527,7 +603,9 @@ def interpret_candidates(
             "Enable deterministic fallback or verify the active Hermes model and retry.",
         )
     return InterpreterResult(
-        candidates=sorted(output, key=lambda item: (item.path, item.symbol, item.category.value)),
+        candidates=sorted(
+            merged_candidates, key=lambda item: (item.path, item.symbol, item.category.value)
+        ),
         suggestions=suggestions,
         status=LlmStatus(
             attempted=bool(calls),
